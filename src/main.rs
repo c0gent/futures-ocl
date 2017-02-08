@@ -29,9 +29,11 @@ use ocl::aliases::ClFloat4;
 
 const INITIAL_BUFFER_LEN: u32 = 2 << 23; // 256MiB of ClFloat4
 // const INITIAL_BUFFER_LEN: u32 = 2 << 25; // 1GiB of ClFloat4
-const SUB_BUF_MIN_LEN: u32 = 2 << 11; // 64KiB of ClFloat4
+// const SUB_BUF_MIN_LEN: u32 = 2 << 11; // 64KiB of ClFloat4
 // const SUB_BUF_MAX_LEN: u32 = 2 << 15; // 1MiB of ClFloat4
-const SUB_BUF_MAX_LEN: u32 = 2 << 19; // 16MiB of ClFloat4
+
+const SUB_BUF_MIN_LEN: u32 = 2 << 16; // 2MiB of ClFloat4
+const SUB_BUF_MAX_LEN: u32 = 2 << 20; // 32MiB of ClFloat4
 
 
 struct PoolRegion {
@@ -806,22 +808,18 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
 
 //#############################################################################
 //#############################################################################
-//########################## ENQUEUE SIMPLE TASK ##############################
+//############################### SIMPLE TASK #################################
 //#############################################################################
 //#############################################################################
 
 fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
-    let task_id = task.task_id;
+    // (0) Write a bunch of 50's:
     let cmd_idx = 0;
-
-    // // (0) Write a bunch of 50's:
-    // let future_data: FutureMappedMem<ClFloat4> = task.map(cmd_idx, buf_pool, thread_pool);
+    let task_id = task.task_id;
 
     //#########################################################################
+    //############################### MAP #####################################
     //#########################################################################
-    //#########################################################################
-
-    // Map some memory for reading or writing.
 
     let (buffer_id, flags) = match task.cmd_graph.commands[cmd_idx].details {
         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
@@ -831,50 +829,33 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    let future = buf.cmd().map(Some(flags), None)
+    let future_data = buf.cmd().map(Some(flags), None)
         .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
         .enq_map_async().unwrap();
 
-
     //#########################################################################
-    //#########################################################################
-    //#########################################################################
-
-    // println!("Awaiting Data [Task: {}]...", task_id);
-
-    // let pooled_data = thread_pool.spawn(
-    //     future.and_then(move |mut data| {
-    //         println!("Data Ready [Task: {}].", task_id);
-
-    //         for val in data.iter_mut() {
-    //             *val = ClFloat4(50., 50., 50., 50.);
-    //         }
-
-    //         Ok(data)
-    //     }));
-
-    // let data = pooled_data.wait().unwrap();
-
-    //#########################################################################
-    //#########################################################################
+    //############################## AWAIT ####################################
     //#########################################################################
 
     println!("Awaiting Data [Task: {}]...", task_id);
+    let pooled_data = thread_pool.spawn(
+        future_data.and_then(move |mut data| {
+            println!("Setting Data Values [Task: {}].", task_id);
 
-    let mut data = future.wait().unwrap().wait().unwrap();
+            for val in data.iter_mut() {
+                *val = ClFloat4(50., 50., 50., 50.);
+            }
 
-    println!("Data Ready [Task: {}].", task_id);
+            Ok(data)
+        }));
 
-
-    for val in data.iter_mut() {
-        *val = ClFloat4(50., 50., 50., 50.);
-    }
+    let data = pooled_data.wait().unwrap();
 
     //#########################################################################
-    //#########################################################################
+    //############################## UNMAP ####################################
     //#########################################################################
 
-    println!("Unmapping Data [Task: {}]...", task_id);
+    println!("Unmapping Data [Task: {}]...", task.task_id);
 
     let buffer_id = match task.cmd_graph.commands[cmd_idx].details {
         CommandDetails::Write { target } => target,
@@ -888,22 +869,72 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
 
     task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
 
-    // let mut data = pooled_data.wait().unwrap();
-
-    // println!("Data Ready.");
-
-    // for val in data.iter_mut() {
-    //     *val = ClFloat4(50., 50., 50., 50.);
-    // }
-
-    // task.unmap(&mut data, 0, buf_pool, thread_pool);
+    //#########################################################################
+    //############################## KERNEL ###################################
+    //#########################################################################
 
     // (1) Run kernel (adds 100 to everything):
     task.kernel(1);
+}
+
+fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
+        correct_val_count: &mut usize)
+{
+    // (2) Read results and verify them:
+    let cmd_idx = 2;
+    let task_id = task.task_id;
 
     //#########################################################################
+    //############################### MAP #####################################
     //#########################################################################
+
+    // (2) Read results and verify them:
+    let (buffer_id, flags) = match task.cmd_graph.commands[2].details {
+        CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
+        CommandDetails::Read { source } => (source, MapFlags::read()),
+        _ => panic!("Task::map: Not a write or read command."),
+    };
+
+    let buf = buf_pool.get(buffer_id).unwrap();
+
+    let future_data = buf.cmd().map(Some(flags), None)
+        .ewait(task.cmd_graph.get_req_events(2).unwrap())
+        .enq_map_async().unwrap();
+
     //#########################################################################
+    //############################## AWAIT ####################################
+    //#########################################################################
+
+    println!("Awaiting Data [Task: {}]...", task.task_id);
+
+    let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
+        println!("Verifying Data Values [Task: {}].", task_id);
+        let mut val_count = 0usize;
+
+        for val in data.iter() {
+            let correct_val = ClFloat4(150., 150., 150., 150.);
+            if *val != correct_val {
+                return Err(format!("Result value mismatch: {:?} != {:?}",
+                    val, correct_val).into())
+            }
+
+            val_count += 1;
+        }
+
+        Ok((data, val_count))
+    }));
+
+    let (mut data, vals_checked) = pooled_data.wait().unwrap();
+    *correct_val_count += vals_checked;
+
+    //#########################################################################
+    //############################## UNMAP ####################################
+    //#########################################################################
+
+    println!("Unmapping Data [Task: {}]...", task.task_id);
+    let mut ev = Event::empty();
+    data.unmap(None, None, Some(&mut ev)).unwrap();
+    task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
 }
 
 
@@ -943,26 +974,6 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
 //     // (6) Kernel C -- Subtract values:
 //     task.kernel(6);
 
-// }
-
-
-// fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
-//         correct_val_count: &mut usize)
-// {
-//     // (2) Read results and verifies them:
-//     let future_data = task.map(2, buf_pool, thread_pool);
-
-//     println!("Awaiting Data...");
-
-//     let pooled_data = thread_pool.spawn(future_data);
-//     let mut data = pooled_data.wait().unwrap();
-
-//     for val in data.iter() {
-//         assert_eq!(*val, ClFloat4(150., 150., 150., 150.));
-//         *correct_val_count += 1;
-//     }
-
-//     task.unmap(&mut data, 2, buf_pool);
 // }
 
 // fn verify_complex_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
@@ -1090,10 +1101,10 @@ fn main() {
 
     // println!("Reading and verifying task results...");
 
-    // // for task in simple_tasks.iter_mut() {
-    // for task in tasks.values_mut() {
-    //     verify_simple_task(task, &buf_pool, &thread_pool, &mut correct_val_count);
-    // }
+    // for task in simple_tasks.iter_mut() {
+    for task in tasks.values_mut() {
+        verify_simple_task(task, &buf_pool, &thread_pool, &mut correct_val_count);
+    }
 
     // for task in complex_tasks.iter_mut() {
     //     verify_complex_task(task, &buf_pool, &thread_pool, &mut correct_val_count);

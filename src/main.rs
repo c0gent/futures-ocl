@@ -405,6 +405,12 @@ impl CommandGraph {
 }
 
 
+enum TaskKind {
+    Simple,
+    Complex,
+}
+
+
 /// The specific details and pieces needed to execute the commands in the
 /// command graph.
 struct Task {
@@ -413,17 +419,19 @@ struct Task {
     queue: Queue,
     kernels: Vec<Kernel>,
     expected_result: Option<ClFloat4>,
+    kind: TaskKind,
 }
 
 impl Task{
     /// Returns a new, empty task.
-    pub fn new(task_id: usize, queue: Queue) -> Task {
+    pub fn new(task_id: usize, queue: Queue, kind: TaskKind) -> Task {
         Task {
             task_id: task_id,
             cmd_graph: CommandGraph::new(),
             queue: queue,
             kernels: Vec::new(),
             expected_result: None,
+            kind: kind,
         }
     }
 
@@ -626,7 +634,7 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
     let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only());
 
     // The container for this task:
-    let mut task = Task::new(task_id, queue.clone());
+    let mut task = Task::new(task_id, queue.clone(), TaskKind::Simple);
 
     // Allocate our input buffer:
     let write_buf_id = match buf_pool.alloc(work_size, write_buf_flags) {
@@ -691,7 +699,7 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
         rng: &mut XorShiftRng) -> Result<Task, ()>
 {
     // The container for this task:
-    let mut task = Task::new(task_id, queue.clone());
+    let mut task = Task::new(task_id, queue.clone(), TaskKind::Complex);
 
     let buffer_count = 7;
 
@@ -829,25 +837,31 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    let future_data = buf.cmd().map(Some(flags), None)
+    let mut future_data = buf.cmd().map(Some(flags), None)
         .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
         .enq_map_async().unwrap();
+
+    let unmap_event = future_data.create_unmap_event().unwrap().clone();
+
+    task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
 
     //#########################################################################
     //############################## AWAIT ####################################
     //#########################################################################
 
     println!("Awaiting Data [Task: {}]...", task_id);
-    let pooled_data = thread_pool.spawn(
-        future_data.and_then(move |mut data| {
-            println!("Setting Data Values [Task: {}].", task_id);
 
-            for val in data.iter_mut() {
-                *val = ClFloat4(50., 50., 50., 50.);
-            }
+    let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
+    // let pooled_data = future_data.and_then(move |mut data| {
+        println!("Setting Data Values [Task: {}].", task_id);
 
-            Ok(data)
-        }));
+        for val in data.iter_mut() {
+            *val = ClFloat4(50., 50., 50., 50.);
+        }
+
+        Ok(data)
+    }));
+    // });
 
     let data = pooled_data.wait().unwrap();
 
@@ -857,17 +871,8 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
 
     println!("Unmapping Data [Task: {}]...", task.task_id);
 
-    let buffer_id = match task.cmd_graph.commands[cmd_idx].details {
-        CommandDetails::Write { target } => target,
-        CommandDetails::Read { source } => source,
-        _ => panic!("Task::unmap: Not a write or read command."),
-    };
 
-    let mut ev = Event::empty();
-
-    data.unmap(None, None, Some(&mut ev)).unwrap();
-
-    task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    // data.unmap(None, None).unwrap();
 
     //#########################################################################
     //############################## KERNEL ###################################
@@ -876,6 +881,7 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_
     // (1) Run kernel (adds 100 to everything):
     task.kernel(1);
 }
+
 
 fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
         correct_val_count: &mut usize)
@@ -897,9 +903,13 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    let future_data = buf.cmd().map(Some(flags), None)
+    let mut future_data = buf.cmd().map(Some(flags), None)
         .ewait(task.cmd_graph.get_req_events(2).unwrap())
         .enq_map_async().unwrap();
+
+    let unmap_event = future_data.create_unmap_event().unwrap().clone();
+
+    task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
 
     //#########################################################################
     //############################## AWAIT ####################################
@@ -908,6 +918,7 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
     println!("Awaiting Data [Task: {}]...", task.task_id);
 
     let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
+    // let pooled_data = future_data.and_then(move |mut data| {
         println!("Verifying Data Values [Task: {}].", task_id);
         let mut val_count = 0usize;
 
@@ -923,6 +934,7 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 
         Ok((data, val_count))
     }));
+    // });
 
     let (mut data, vals_checked) = pooled_data.wait().unwrap();
     *correct_val_count += vals_checked;
@@ -932,9 +944,9 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
     //#########################################################################
 
     println!("Unmapping Data [Task: {}]...", task.task_id);
-    let mut ev = Event::empty();
-    data.unmap(None, None, Some(&mut ev)).unwrap();
-    task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    // let mut ev = Event::empty();
+    // data.unmap(None, None)).unwrap();
+    // task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
 }
 
 
@@ -1113,14 +1125,20 @@ fn main() {
 
     let verify_duration = chrono::Local::now() - start_time - create_duration - run_duration;
 
+
+
+    let final_duration = chrono::Local::now() - start_time - create_duration - run_duration -
+        verify_duration;
+
     // println!("All {} (float4) result values from {} simple and {} complex tasks are correct! \n\
     //     Durations => | Create: {} | Run: {} | Verify: {} | ",
     //     correct_val_count, simple_tasks.len(), complex_tasks.len(), fmt_duration(create_duration),
     //     fmt_duration(run_duration), fmt_duration(verify_duration));
     println!("All {} (float4) result values from {} tasks are correct! \n\
-        Durations => | Create: {} | Run: {} | Verify: {} | ",
+        Durations => | Create: {} | Run: {} | Verify: {} | Final: {} | ",
         correct_val_count, tasks.len(), fmt_duration(create_duration),
-        fmt_duration(run_duration), fmt_duration(verify_duration));
+        fmt_duration(run_duration), fmt_duration(verify_duration),
+        fmt_duration(final_duration));
 }
 
 

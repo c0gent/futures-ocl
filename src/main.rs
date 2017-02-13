@@ -574,6 +574,8 @@ impl Task{
     }
 }
 
+
+
 fn coeff(add: bool) -> f32 {
     if add { 1. } else { -1. }
 }
@@ -848,19 +850,24 @@ fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread
     // buf.default_queue().finish();
 
     println!("Awaiting Data (Initiate) [Task: {}]...", task_id);
-    // let mut future_data = buf.cmd().map(Some(flags), None)
-    //     .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-    //   .enq_async().unwrap();
-    let mut data = buf.cmd().map(Some(flags), None)
+    let mut future_data = buf.cmd().map(Some(flags), None)
         .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-        .enq().unwrap();
+        .enq_async().unwrap();
+
+    // let mut data = buf.cmd().map(Some(flags), None)
+    //     .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
+    //     .enq().unwrap();
 
     // println!("Blocking on buffer queue.");
     // buf.default_queue().finish();
 
-    // let unmap_event = future_data.create_unmap_target().unwrap().clone();
-    // println!("Setting command event for map [buffer_id: {}, cmd_idx: {}]. Event: {:?}.", buffer_id, cmd_idx, unmap_event);
-    // task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
+    /////// SET UNMAP EVENT:
+        let unmap_event = future_data.create_unmap_target().unwrap().clone();
+        println!("Setting command event for map [buffer_id: {}, cmd_idx: {}]. Event: {:?}.", buffer_id, cmd_idx, unmap_event);
+        task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
+    ///////
+
+    let mut data = future_data.wait().unwrap();
 
     //#########################################################################
     //############################## AWAIT ####################################
@@ -900,8 +907,10 @@ fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread
     // println!("Blocking on buffer queue.");
     // buf.default_queue().finish();
 
-    println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.", task_id, buffer_id, cmd_idx, ev);
-    task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    /////// SET UNMAP EVENT:
+        // println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.", task_id, buffer_id, cmd_idx, ev);
+        // task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    ///////
 
     //#########################################################################
     //############################## KERNEL ###################################

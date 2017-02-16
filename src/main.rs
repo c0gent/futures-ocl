@@ -1,16 +1,22 @@
-#![allow(dead_code, unused_variables, unused_imports, unused_mut)]
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
 
+extern crate libc;
 extern crate futures;
 extern crate futures_cpupool;
 extern crate tokio_timer;
 extern crate rand;
 extern crate chrono;
 extern crate ocl;
+#[macro_use] extern crate lazy_static;
+#[macro_use] extern crate colorify;
 
-mod dinglehopper;
+mod extras;
+mod switches;
+mod device_check;
 
 // use std::io;
 use std::time::Duration;
+use libc::c_void;
 use futures::future::*;
 use futures::{Future, Async};
 use futures_cpupool::{CpuPool, CpuFuture};
@@ -25,384 +31,30 @@ use ocl::{Platform, Device, Context, Queue, Program, Buffer, Kernel, SubBuffer, 
 // use ocl::core::{FutureMappedMem, MappedMem};
 use ocl::flags::{MemFlags, MapFlags, CommandQueueProperties};
 use ocl::aliases::ClFloat4;
+use ocl::core::{self, UserEvent as UserEventCore};
 
+use extras::{BufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
+use switches::{Switches, SWITCHES};
 
-const INITIAL_BUFFER_LEN: u32 = 2 << 23; // 256MiB of ClFloat4
-// const INITIAL_BUFFER_LEN: u32 = 2 << 25; // 1GiB of ClFloat4
+// // ORIGINAL SIZES:
+// const INITIAL_BUFFER_LEN: u32 = 2 << 23; // 256MiB of ClFloat4
 // const SUB_BUF_MIN_LEN: u32 = 2 << 11; // 64KiB of ClFloat4
 // const SUB_BUF_MAX_LEN: u32 = 2 << 15; // 1MiB of ClFloat4
 
-const SUB_BUF_MIN_LEN: u32 = 2 << 16; // 2MiB of ClFloat4
-const SUB_BUF_MAX_LEN: u32 = 2 << 20; // 32MiB of ClFloat4
+// // LARGER BUFFER:
+// const INITIAL_BUFFER_LEN: u32 = 2 << 25; // 1GiB of ClFloat4
 
+// // LARGER SUB-BUFFERS:
+// const INITIAL_BUFFER_LEN: u32 = 2 << 23; // 256MiB of ClFloat4
+// const SUB_BUF_MIN_LEN: u32 = 2 << 19; // 16MiB of ClFloat4
+// const SUB_BUF_MAX_LEN: u32 = 2 << 21; // 64MiB of ClFloat4
 
-struct PoolRegion {
-    buffer_id: usize,
-    origin: u32,
-    len: u32,
-}
+// // STILL LARGER SUB-BUFFERS:
+const INITIAL_BUFFER_LEN: u32 = 2 << 25; // 512MiB of ClFloat4
 
-/// A simple (linear search) sub-buffer allocator.
-struct BufferPool<T: OclPrm> {
-    buffer: Buffer<T>,
-    regions: LinkedList<PoolRegion>,
-    sub_buffers: HashMap<usize, SubBuffer<T>>,
-    align: u32,
-    _next_uid: usize,
-}
+const SUB_BUF_MIN_LEN: u32 = 2 << 23;
+const SUB_BUF_MAX_LEN: u32 = 2 << 24;
 
-impl<T: OclPrm> BufferPool<T> {
-    /// Returns a new buffer pool.
-    pub fn new(len: u32, default_queue: Queue) -> BufferPool<T> {
-        let align = default_queue.device().mem_base_addr_align().unwrap();
-        let flags = Some(MemFlags::alloc_host_ptr() | MemFlags::read_write());
-        let buffer = Buffer::<T>::new(default_queue, flags, len, None).unwrap();
-
-        BufferPool {
-            buffer: buffer,
-            regions: LinkedList::new(),
-            sub_buffers: HashMap::new(),
-            align: align,
-            _next_uid: 0,
-        }
-    }
-
-    fn next_valid_align(&self, unaligned_origin: u32) -> u32 {
-        ((unaligned_origin / self.align) + 1) * self.align
-    }
-
-    fn next_uid(&mut self) -> usize {
-        self._next_uid += 1;
-        self._next_uid - 1
-    }
-
-    fn insert_region(&mut self, region: PoolRegion, region_idx: usize) {
-        let mut tail = self.regions.split_off(region_idx);
-        self.regions.push_back(region);
-        self.regions.append(&mut tail);
-    }
-
-    fn create_sub_buffer(&mut self, region_idx: usize, flags: Option<MemFlags>,
-            origin: u32, len: u32) -> usize
-    {
-        let buffer_id = self.next_uid();
-        let region = PoolRegion { buffer_id: buffer_id, origin: origin, len: len };
-        let sbuf = self.buffer.create_sub_buffer(flags, region.origin, region.len).unwrap();
-        if let Some(idx) = self.sub_buffers.insert(region.buffer_id, sbuf) {
-            panic!("Duplicate indexes: {}", idx); }
-        self.insert_region(region, region_idx);
-        buffer_id
-    }
-
-    /// Allocates space for and creates a new sub-buffer then returns the
-    /// buffer id which can be used to `::get` or `::free` it.
-    pub fn alloc(&mut self, len: u32, flags: Option<MemFlags>) -> Result<usize, ()> {
-        assert!(self.regions.len() == self.sub_buffers.len());
-
-        match self.regions.front() {
-            Some(_) => {
-                let mut end_prev = 0;
-                let mut create_at = None;
-
-                for (region_idx, region) in self.regions.iter().enumerate() {
-                    if region.origin - end_prev >= len {
-                        create_at = Some(region_idx);
-                        break;
-                    } else {
-                        end_prev = self.next_valid_align(region.origin + region.len);
-                    }
-                }
-
-                if let Some(region_idx) = create_at {
-                    Ok(self.create_sub_buffer(region_idx, flags, end_prev, len))
-                } else if self.buffer.len() as u32 - end_prev >= len {
-                    let region_idx = self.regions.len();
-                    Ok(self.create_sub_buffer(region_idx, flags, end_prev, len))
-                } else {
-                    Err(())
-                }
-            },
-            None => {
-                Ok(self.create_sub_buffer(0, flags, 0, len))
-            },
-        }
-    }
-
-    /// Deallocates the buffer identified by `buffer_id` or returns it back in
-    /// the event of a failure.
-    pub fn free(&mut self, buffer_id: usize) -> Result<(), usize> {
-        let mut region_idx = None;
-
-        // The `SubBuffer` drops here when it goes out of scope:
-        if let Some(_) = self.sub_buffers.remove(&buffer_id) {
-            region_idx = self.regions.iter().position(|r| r.buffer_id == buffer_id);
-        }
-
-        if let Some(r_idx) = region_idx {
-            let mut tail = self.regions.split_off(r_idx);
-            tail.pop_front().ok_or(buffer_id)   ?;
-            self.regions.append(&mut tail);
-            Ok(())
-        } else {
-            Err(buffer_id)
-        }
-    }
-
-    /// Returns a reference to the sub-buffer identified by `buffer_id`.
-    pub fn get(&self, buffer_id: usize) -> Option<&SubBuffer<T>> {
-        self.sub_buffers.get(&buffer_id)
-    }
-
-    /// Returns a mutable reference to the sub-buffer identified by `buffer_id`.
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self, buffer_id: usize) -> Option<&mut SubBuffer<T>> {
-        self.sub_buffers.get_mut(&buffer_id)
-    }
-
-    /// Defragments the buffer. Be sure to `::finish()` any and all command
-    /// queues you may be using before doing this.
-    ///
-    /// All kernels with a buffer argument set to any of the sub-buffers in
-    /// this pool will need to be created anew or arguments refreshed (use
-    /// `Kernel::arg_..._named` when initializing arguments in order to change
-    /// them later).
-    #[allow(dead_code)]
-    pub fn defrag(&mut self) {
-        // - Iterate through sub-buffers, dropping and recreating at the
-        //   leftmost (lowest) available address within the buffer, optionally
-        //   copying old data to the new position in device memory.
-        // - Rebuild regions list (or just update offsets).
-        unimplemented!();
-    }
-
-    /// Shrinks or grows and defragments the main buffer. Invalidates all
-    /// kernels referencing sub-buffers in this pool. See `::defrag` for more
-    /// information.
-    #[allow(dead_code, unused_variables)]
-    pub fn resize(&mut self, len: u32) {
-        // Allocate a new buffer then copy old buffer contents one sub-buffer
-        // at a time, defragmenting in the process.
-        unimplemented!();
-    }
-}
-
-
-struct RwCmdIdxs {
-    writers: Vec<usize>,
-    readers: Vec<usize>,
-}
-
-impl RwCmdIdxs {
-    fn new() -> RwCmdIdxs {
-        RwCmdIdxs { writers: Vec::new(), readers: Vec::new() }
-    }
-}
-
-#[allow(dead_code)]
-struct KernelArgBuffer {
-    arg_idx: usize, // Will be used when refreshing kernels after defragging or resizing.
-    buffer_id: usize,
-}
-
-impl KernelArgBuffer {
-    pub fn new(arg_idx: usize, buffer_id: usize) -> KernelArgBuffer {
-        KernelArgBuffer { arg_idx: arg_idx, buffer_id: buffer_id }
-    }
-}
-
-
-/// Details of a queuable command.
-enum CommandDetails {
-    Fill { target: usize },
-    Write { target: usize },
-    Read { source: usize },
-    Copy { source: usize, target: usize },
-    Kernel { id: usize, sources: Vec<KernelArgBuffer>, targets: Vec<KernelArgBuffer> },
-}
-
-impl CommandDetails {
-    pub fn sources(&self) -> Vec<usize> {
-        match *self {
-            CommandDetails::Fill { .. } => vec![],
-            CommandDetails::Read { source } => vec![source],
-            CommandDetails::Write { .. } => vec![],
-            CommandDetails::Copy { source, .. } => vec![source],
-            CommandDetails::Kernel { ref sources, .. } => {
-                sources.iter().map(|arg| arg.buffer_id).collect()
-            },
-        }
-    }
-
-    pub fn targets(&self) -> Vec<usize> {
-        match *self {
-            CommandDetails::Fill { target } => vec![target],
-            CommandDetails::Read { .. } => vec![],
-            CommandDetails::Write { target } => vec![target],
-            CommandDetails::Copy { target, .. } => vec![target],
-            CommandDetails::Kernel { ref targets, .. } => {
-                targets.iter().map(|arg| arg.buffer_id).collect()
-            },
-        }
-    }
-}
-
-
-struct Command {
-    details: CommandDetails,
-    event: Option<Event>,
-    requisite_events: EventList,
-}
-
-impl Command {
-    pub fn new(details: CommandDetails) -> Command {
-        Command {
-            details: details,
-            event: None,
-            requisite_events: EventList::new(),
-        }
-    }
-
-    /// Returns a list of commands which both precede a command and which
-    /// write to a block of memory which is read from by that command.
-    pub fn preceding_writers(&self, cmds: &HashMap<usize, RwCmdIdxs>) -> BTreeSet<usize> {
-        let pre_writers = self.details.sources().iter().flat_map(|cmd_src_block|
-                cmds.get(cmd_src_block).unwrap().writers.iter().cloned()).collect();
-
-        pre_writers
-    }
-
-    /// Returns a list of commands which both follow a command and which read
-    /// from a block of memory which is written to by that command.
-    pub fn following_readers(&self, cmds: &HashMap<usize, RwCmdIdxs>) -> BTreeSet<usize> {
-        let fol_readers = self.details.targets().iter().flat_map(|cmd_tar_block|
-                cmds.get(cmd_tar_block).unwrap().readers.iter().cloned()).collect();
-
-        fol_readers
-    }
-}
-
-
-/// A sequence dependency graph representing the temporal requirements of each
-/// asynchronous read, write, copy, and kernel (commands) for a particular
-/// task.
-///
-/// Obviously this is an overkill for this example but this graph is flexible
-/// enough to schedule execution correctly and optimally with arbitrarily many
-/// parallel tasks with arbitrary duration reads, writes and kernels.
-///
-/// Note that in this example we are using `buffer_id` a `usize` to represent
-/// memory regions (because that's what the allocator above is using) but we
-/// could easily use multiple part, complex identifiers/keys. For example, we
-/// may have a program with a large number of buffers which are organized into
-/// a complex hierarchy or some other arbitrary structure. We could swap
-/// `buffer_id` for some value which represented that as long as the
-/// identifier we used could uniquely identify each subsection of memory. We
-/// could also use ranges of values and do an overlap check and have
-/// byte-level precision.
-///
-struct CommandGraph {
-    commands: Vec<Command>,
-    command_requisites: Vec<Vec<usize>>,
-    locked: bool,
-    next_cmd_idx: usize,
-}
-
-impl CommandGraph {
-    /// Returns a new, empty graph.
-    pub fn new() -> CommandGraph {
-        CommandGraph {
-            commands: Vec::new(),
-            command_requisites: Vec::new(),
-            locked: false,
-            next_cmd_idx: 0,
-        }
-    }
-
-    /// Adds a new command and returns the command index if successful.
-    pub fn add(&mut self, command: Command) -> Result<usize, ()> {
-        if self.locked { return Err(()); }
-        self.commands.push(command);
-        self.command_requisites.push(Vec::new());
-        Ok(self.commands.len() - 1)
-    }
-
-    /// Returns a sub-buffer map which contains every command that reads from
-    /// or writes to each sub-buffer.
-    fn readers_and_writers_by_sub_buffer(&self) -> HashMap<usize, RwCmdIdxs> {
-        let mut cmds = HashMap::new();
-
-        for (cmd_idx, cmd) in self.commands.iter().enumerate() {
-            for cmd_src_block in cmd.details.sources().into_iter() {
-                let rw_cmd_idxs = cmds.entry(cmd_src_block.clone())
-                    .or_insert(RwCmdIdxs::new());
-
-                rw_cmd_idxs.readers.push(cmd_idx);
-            }
-
-            for cmd_tar_block in cmd.details.targets().into_iter() {
-                let rw_cmd_idxs = cmds.entry(cmd_tar_block.clone())
-                    .or_insert(RwCmdIdxs::new());
-
-                rw_cmd_idxs.writers.push(cmd_idx);
-            }
-        }
-
-        cmds
-    }
-
-    /// Populates the list of requisite commands necessary for building the
-    /// correct event wait list for each command.
-    pub fn populate_requisites(&mut self) {
-        let cmds = self.readers_and_writers_by_sub_buffer();
-
-        for (cmd_idx, cmd) in self.commands.iter_mut().enumerate() {
-            assert!(self.command_requisites[cmd_idx].is_empty());
-
-            for &req_cmd_idx in cmd.preceding_writers(&cmds).iter()
-                    .chain(cmd.following_readers(&cmds).iter())
-            {
-                self.command_requisites[cmd_idx].push(req_cmd_idx);
-            }
-
-            self.command_requisites[cmd_idx].shrink_to_fit();
-        }
-
-        self.commands.shrink_to_fit();
-        self.command_requisites.shrink_to_fit();
-        self.locked = true;
-    }
-
-    /// Returns the list of requisite events for a command.
-    pub fn get_req_events(&mut self, cmd_idx: usize) -> Result<&EventList, &'static str> {
-        if !self.locked { return Err("Call '::populate_requisites' first."); }
-        if self.next_cmd_idx != cmd_idx { return Err("Command events requested out of order."); }
-
-        self.commands[cmd_idx].requisite_events.clear().unwrap();
-
-        for &req_idx in self.command_requisites[cmd_idx].iter() {
-            if let Some(event) = self.commands[req_idx].event.clone() {
-                self.commands[cmd_idx].requisite_events.push(event);
-            }
-        }
-
-        Ok(&self.commands[cmd_idx].requisite_events)
-    }
-
-    /// Sets the event associated with the completion of a command.
-    pub fn set_cmd_event(&mut self, cmd_idx: usize, event: Event) -> Result<(), &'static str> {
-        if !self.locked { return Err("Call '::populate_requisites' first."); }
-
-        self.commands[cmd_idx].event = Some(event);
-
-        if (self.next_cmd_idx + 1) == self.commands.len() {
-            self.next_cmd_idx = 0;
-        } else {
-            self.next_cmd_idx += 1;
-        }
-
-        Ok(())
-    }
-}
 
 
 enum TaskKind {
@@ -420,11 +72,12 @@ struct Task {
     kernels: Vec<Kernel>,
     expected_result: Option<ClFloat4>,
     kind: TaskKind,
+    work_size: u32,
 }
 
 impl Task{
     /// Returns a new, empty task.
-    pub fn new(task_id: usize, queue: Queue, kind: TaskKind) -> Task {
+    pub fn new(task_id: usize, queue: Queue, kind: TaskKind, work_size: u32) -> Task {
         Task {
             task_id: task_id,
             cmd_graph: CommandGraph::new(),
@@ -432,6 +85,7 @@ impl Task{
             kernels: Vec::new(),
             expected_result: None,
             kind: kind,
+            work_size: work_size,
         }
     }
 
@@ -479,7 +133,7 @@ impl Task{
 
     /// Fill a buffer with a pattern of data:
     pub fn fill<T: OclPrm>(&mut self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>) {
-        let buffer_id = match self.cmd_graph.commands[cmd_idx].details {
+        let buffer_id = match *self.cmd_graph.commands()[cmd_idx].details() {
             CommandDetails::Fill { target } => target,
             _ => panic!("Task::fill: Not a fill command."),
         };
@@ -499,7 +153,7 @@ impl Task{
     // pub fn map<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>,
     //         thread_pool: &CpuPool) -> FutureMappedMem<T>
     // {
-    //     let (buffer_id, flags) = match self.cmd_graph.commands[cmd_idx].details {
+    //     let (buffer_id, flags) = match self.cmd_graph.commands()[cmd_idx].details(){
     //         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
     //         CommandDetails::Read { source } => (source, MapFlags::read()),
     //         _ => panic!("Task::map: Not a write or read command."),
@@ -520,7 +174,7 @@ impl Task{
     // pub fn unmap<T: OclPrm>(&mut self, data: &mut MappedMem<T>, cmd_idx: usize,
     //         buf_pool: &BufferPool<T>)
     // {
-    //     let buffer_id = match self.cmd_graph.commands[cmd_idx].details {
+    //     let buffer_id = match self.cmd_graph.commands()[cmd_idx].details(){
     //         CommandDetails::Write { target } => target,
     //         CommandDetails::Read { source } => source,
     //         _ => panic!("Task::unmap: Not a write or read command."),
@@ -535,7 +189,7 @@ impl Task{
 
     /// Copy contents of one buffer to another.
     pub fn copy<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>) {
-        let (src_buf_id, tar_buf_id) = match self.cmd_graph.commands[cmd_idx].details {
+        let (src_buf_id, tar_buf_id) = match *self.cmd_graph.commands()[cmd_idx].details(){
             CommandDetails::Copy { source, target } => (source, target),
             _ => panic!("Task::copy: Not a copy command."),
         };
@@ -552,26 +206,30 @@ impl Task{
         self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
     }
 
-    /// Enqueue a kernel.
-    pub fn kernel(&mut self, cmd_idx: usize) {
-        let kernel_id = match self.cmd_graph.commands[cmd_idx].details {
-            CommandDetails::Kernel { id, .. } => id,
-            _ => panic!("Task::kernel: Not a kernel command."),
-        };
 
-        let mut ev = Event::empty();
+    //#############################################################################
+    //#############################################################################
+    //########################### ENQUEUE A KERNEL ################################
+    //#############################################################################
+    //#############################################################################
 
-        self.kernels[kernel_id].cmd().enew(&mut ev)
-            .ewait(self.cmd_graph.get_req_events(cmd_idx).unwrap())
-            .enq().unwrap();
+    // /// Enqueue a kernel.
+    // pub fn kernel(&mut self, cmd_idx: usize) {
+    //     let kernel_id = match *self.cmd_graph.commands()[cmd_idx].details(){
+    //         CommandDetails::Kernel { id, .. } => id,
+    //         _ => panic!("Task::kernel: Not a kernel command."),
+    //     };
 
-        println!("Setting command event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. Event: {:?}.", self.task_id, kernel_id, cmd_idx, ev);
+    //     let mut ev = Event::empty();
 
-        self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    //     self.kernels[kernel_id].cmd().enew(&mut ev)
+    //         .ewait(self.cmd_graph.get_req_events(cmd_idx).unwrap())
+    //         .enq().unwrap();
 
-        // println!("Blocking on kernel queue.");
-        // self.kernels[kernel_id].default_queue().finish();
-    }
+    //     println!("Setting command completion event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. Event: {:?}.", self.task_id, kernel_id, cmd_idx, ev);
+
+    //     self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    // }
 }
 
 
@@ -593,34 +251,34 @@ fn coeff(add: bool) -> f32 {
 /// believe all/most OpenCL vendors have offline LLVM -> Binary compilers for
 /// older hardware. [TODO]: Investigate this.
 ///
-fn gen_kern_src(kernel_name: &str, simple: bool, add: bool) -> String {
+fn gen_kern_src(kernel_name: &str, type_str: &str, simple: bool, add: bool) -> String {
     let op = if add { "+" } else { "-" };
 
     if simple {
         format!(r#"__kernel void {}(
-                __global float4* in,
-                float4 values,
-                __global float4* out)
+                __global {ts}* in,
+                {ts} values,
+                __global {ts}* out)
             {{
                 uint idx = get_global_id(0);
                 out[idx] = in[idx] {} values;
             }}"#
             ,
-            kernel_name, op
+            kn=kernel_name, op=op, ts=type_str
         )
     } else {
-        format!(r#"__kernel void {}(
-                __global float4* in_0,
-                __global float4* in_1,
-                __global float4* in_2,
-                float4 values,
-                __global float4* out)
+        format!(r#"__kernel void {kn}(
+                __global {ts}* in_0,
+                __global {ts}* in_1,
+                __global {ts}* in_2,
+                {ts} values,
+                __global {ts}* out)
             {{
                 uint idx = get_global_id(0);
-                out[idx] = in_0[idx] {} in_1[idx] {} in_2[idx] {} values;
+                out[idx] = in_0[idx] {op} in_1[idx] {op} in_2[idx] {op} values;
             }}"#
             ,
-            kernel_name, op, op, op
+            kn=kernel_name, op=op, ts=type_str
         )
     }
 }
@@ -639,9 +297,11 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
 {
     let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only());
     let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only());
+    // let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only() | MemFlags::alloc_host_ptr());
+    // let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only() | MemFlags::alloc_host_ptr());
 
     // The container for this task:
-    let mut task = Task::new(task_id, queue.clone(), TaskKind::Simple);
+    let mut task = Task::new(task_id, queue.clone(), TaskKind::Simple, work_size);
 
     // Allocate our input buffer:
     let write_buf_id = match buf_pool.alloc(work_size, write_buf_flags) {
@@ -658,16 +318,19 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
         },
     };
 
+    let write_buf = buf_pool.get(write_buf_id).unwrap();
+    let read_buf = buf_pool.get(read_buf_id).unwrap();
+
     let program = Program::builder()
         .devices(device)
-        .src(gen_kern_src("kern", true, true))
+        .src(gen_kern_src("kern", "float4", true, true))
         .build(context).unwrap();
 
     let kern = Kernel::new("kern", &program, queue).unwrap()
         .gws(work_size)
-        .arg_buf(buf_pool.get(write_buf_id).unwrap())
+        .arg_buf(write_buf)
         .arg_vec(ClFloat4(100., 100., 100., 100.))
-        .arg_buf(buf_pool.get(read_buf_id).unwrap());
+        .arg_buf(read_buf);
 
     // (0) Initial write to device:
     assert!(task.add_write_command(write_buf_id).unwrap() == 0);
@@ -706,7 +369,7 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
         rng: &mut XorShiftRng) -> Result<Task, ()>
 {
     // The container for this task:
-    let mut task = Task::new(task_id, queue.clone(), TaskKind::Complex);
+    let mut task = Task::new(task_id, queue.clone(), TaskKind::Complex, work_size);
 
     let buffer_count = 7;
 
@@ -747,9 +410,9 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
 
     let program = Program::builder()
         .devices(device)
-        .src(gen_kern_src("kernel_a", true, kern_a_sign))
-        .src(gen_kern_src("kernel_b", false, kern_b_sign))
-        .src(gen_kern_src("kernel_c", true, kern_c_sign))
+        .src(gen_kern_src("kernel_a", "float4", true, kern_a_sign))
+        .src(gen_kern_src("kernel_b", "float4", false, kern_b_sign))
+        .src(gen_kern_src("kernel_c", "float4", true, kern_c_sign))
         .build(context).unwrap();
 
     let kernel_a = Kernel::new("kernel_a", &program, queue.clone()).unwrap()
@@ -823,9 +486,10 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
 
 //#############################################################################
 //#############################################################################
-//############################### SIMPLE TASK #################################
+//######################### INITIATE SIMPLE TASK ##############################
 //#############################################################################
 //#############################################################################
+
 
 fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
     println!("Initiating simple task [Task: {}]...", task.task_id);
@@ -838,94 +502,202 @@ fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread
     //############################### MAP #####################################
     //#########################################################################
 
-    let (buffer_id, flags) = match task.cmd_graph.commands[cmd_idx].details {
+    let (buffer_id, flags) = match *task.cmd_graph.commands()[cmd_idx].details(){
         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
-        CommandDetails::Read { source } => (source, MapFlags::read()),
+        // CommandDetails::Write { target } => (target, MapFlags::write()),
+        // CommandDetails::Read { source } => (source, MapFlags::read()),
+        CommandDetails::Read { .. } => panic!("Incorrect command type."),
         _ => panic!("Task::map: Not a write or read command."),
     };
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
+    let mut map_event = Event::empty();
 
-    println!("Awaiting Data (Initiate) [Task: {}]...", task_id);
-    let mut future_data = buf.cmd().map(Some(flags), None)
-        .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-        .enq_async().unwrap();
+    println!("Awaiting Data (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+    /////// ASYNC:
+        let mut future_data: FutureMappedMem<ClFloat4> = buf.cmd().map().flags(flags)
+            .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
+            .enew(&mut map_event)
+            .enq_async().unwrap();
 
-    // let mut data = buf.cmd().map(Some(flags), None)
-    //     .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-    //     .enq().unwrap();
-
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
-
-    /////// SET UNMAP EVENT:
-        let unmap_event = future_data.create_unmap_target().unwrap().clone();
-        println!("Setting command event for map [buffer_id: {}, cmd_idx: {}]. Event: {:?}.", buffer_id, cmd_idx, unmap_event);
-        task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
+        // let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
+        // println!("Setting command completion event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.",
+        //     task_id, buffer_id, cmd_idx, unmap_event_target);
+        // task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
+    ///////
+    /////// SYNC:
+        // let mut data = buf.cmd().map().flags(flags)
+        //     .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
+        //     .enew(&mut map_event)
+        //     .enq().unwrap();
     ///////
 
-    let mut data = future_data.wait().unwrap();
+
+    // let user_map_event = UserEventCore::new(buf.default_queue().context_core()).unwrap();
+
+    // unsafe {
+    //     let unmap_target_ptr = user_map_event.into_raw();
+    //     map_event.set_callback(Some(core::_complete_user_event), unmap_target_ptr).unwrap();
+    // }
+
+
 
     //#########################################################################
     //############################## AWAIT ####################################
     //#########################################################################
 
-    println!("Awaiting Data (Initiate) [Task: {}]...", task_id);
+    println!("Awaiting Data (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
 
-    // // let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
-    // let pooled_data = future_data.and_then(move |mut data| {
-    //     println!("Setting Data Values [Task: {}].", task_id);
+    //////// ASYNC (POOL):
+        // // let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
+        // let pooled_data = future_data.and_then(move |mut data| {
+        //     println!("Setting Data Values [Task: {}].", task_id);
 
-    //     for val in data.iter_mut() {
-    //         *val = ClFloat4(50., 50., 50., 50.);
-    //     }
+        //     for val in data.iter_mut() {
+        //         *val = ClFloat4(50., 50., 50., 50.);
+        //     }
 
-    //     Ok(data)
-    // // }));
-    // });
+        //     Ok(data)
+        // // }));
+        // });
 
-    // let mut data = pooled_data.wait().unwrap();
+        // let mut data = pooled_data.wait().unwrap();
+    ////////
 
+    //////// ASYNC (UNPOOLED):
+        // let map_event_status = core::event_status(&map_event).unwrap();
+        // printlnc!(dark_grey: "Map Event Status (Initiate) [Task: {}, Buffer: {}] (PRE-WAIT): {:?} -> {:?}",
+        //     task_id, buffer_id, map_event, map_event_status);
 
-    println!("Setting Data Values (Initiate) [Task: {}].", task_id);
+        let mut data = future_data.wait().unwrap();
+
+        // let map_event_status = core::event_status(&map_event).unwrap();
+        // printlnc!(dark_grey: "Map Event Status (Initiate) [Task: {}, Buffer: {}] (POST-WAIT): {:?} -> {:?}",
+            // task_id, buffer_id, map_event, map_event_status);
+    ////////
+
+    /////// [---- LINCHPIN ----][---- LINCHPIN ----][---- LINCHPIN ----][AFFECTS MAP WRITE DATA]:
+        // buf.default_queue().finish();
+    ////////
+
+    //////// [OPTIONAL (EVENT)]:
+        //// THESE DO NOT BLOCK:
+        // map_event.wait_for().unwrap();
+        // user_map_event.wait_for().unwrap();
+    ////////
+
+    println!("Setting Data Values (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+
+    // // Ensure data buffer is equal to work size.
+    // assert!(data.len() == task.work_size as usize);
 
     for val in data.iter_mut() {
         *val = ClFloat4(50., 50., 50., 50.);
     }
 
+    for val in data.iter() {
+        if *val != ClFloat4(50., 50., 50., 50.) {
+            panic!("VAL = {:?}", *val);
+        }
+    }
+
+    return;
+
     //#########################################################################
     //############################## UNMAP ####################################
     //#########################################################################
 
-    let mut ev = Event::empty();
+    //////////////////// PROBLEM IS NOT BELOW THIS LINE ///////////////////////
+    //       (but it must be adjusted based on what is set above)            //
 
-    println!("Enqueuing Unmap (Initiate) [Task: {}]...", task_id);
-    data.enqueue_unmap(None, None::<Event>, Some(&mut ev)).unwrap();
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
 
-    /////// SET UNMAP EVENT:
-        // println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.", task_id, buffer_id, cmd_idx, ev);
-        // task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    /////// UNMAP & SET UNMAP EVENT [SYNC]:
+        println!("Enqueuing Unmap (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+        let mut unmap_event = Event::empty();
+        data.enqueue_unmap(None, None::<Event>, Some(&mut unmap_event)).unwrap();
+        println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. \
+            Event: {:?}.", task_id, buffer_id, cmd_idx, unmap_event);
+        task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.clone()).unwrap();
     ///////
+
+    /////// UNMAP ONLY (EVENT ALREADY SET) [ASYNC]:
+        // println!("########### Enqueuing Unmap (Initiate) [Task: {}]...", task_id);
+        // data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
+    ///////
+
+    /////// EXPERIMENTALLY CREATE UNMAP EVENT DOWN HERE [ASYNC] (WON'T WORK because future is gone):
+        // let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
+        // println!("Setting command completion event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.",
+        //     task_id, buffer_id, cmd_idx, unmap_event_target);
+        // task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
+    ///////
+
+    /////// [---- LINCHPIN ----][AFFECTS KERNEL DATA]:
+        // buf.default_queue().finish();
+    ///////
+
 
     //#########################################################################
     //############################## KERNEL ###################################
     //#########################################################################
 
+    //////////////////// PROBLEM IS NOT BELOW THIS LINE ///////////////////////
+
     // (1) Run kernel (adds 100 to everything):
-    println!("Enqueuing Kernel (Initiate) [Task: {}]...", task_id);
-    task.kernel(1);
+    // println!("Enqueuing Kernel (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+    // task.kernel(1);
+
+    let cmd_idx = 1;
+
+    let kernel_id = match *task.cmd_graph.commands()[cmd_idx].details(){
+        CommandDetails::Kernel { id, .. } => id,
+        _ => panic!("Task::kernel: Not a kernel command."),
+    };
+
+    let kernel = &task.kernels[kernel_id];
+
+    /////// [OPTIONAL (NO EFFECT)]:
+        // kernel.default_queue().finish();
+    ///////
+
+    let enew = {
+        /////// [NO EFFECT]:
+            let ewait = task.cmd_graph.get_req_events(cmd_idx).unwrap();
+            // let ewait = &unmap_event;
+        ///////
+
+        let mut enew = Event::empty();
+
+        println!("Enqueuing Kernel (Initiate) [Task: {}, Buffer: {}]: \n\
+            - Wait Events: {:?}", task_id, buffer_id, ewait);
+
+        kernel.cmd()
+            .ewait(ewait)
+            .enew(&mut enew)
+            .enq().unwrap();
+
+        println!("Setting command completion event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. \
+            Event: {:?}.", task.task_id, kernel_id, cmd_idx, enew);
+
+        enew
+    };
+
+    task.cmd_graph.set_cmd_event(cmd_idx, enew).unwrap();
 }
 
+
+//#############################################################################
+//#############################################################################
+//########################### VERIFY SIMPLE TASK ##############################
+//#############################################################################
+//#############################################################################
 
 fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
         correct_val_count: &mut usize)
 {
-    println!("Verifying simple task...");
+
+    println!("\n\nVerifying simple task...");
 
     // (2) Read results and verify them:
     let cmd_idx = 2;
@@ -936,7 +708,7 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
     //#########################################################################
 
     // (2) Read results and verify them:
-    let (buffer_id, flags) = match task.cmd_graph.commands[2].details {
+    let (buffer_id, flags) = match *task.cmd_graph.commands()[cmd_idx].details(){
         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
         CommandDetails::Read { source } => (source, MapFlags::read()),
         _ => panic!("Task::map: Not a write or read command."),
@@ -944,19 +716,24 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
+    /////// [NO EFFECT]:
+        // buf.default_queue().finish();
+    ///////
 
-    println!("Enqueuing Map (Verify) [Task: {}]...", task.task_id);
+    // println!("Enqueuing Map (Verify) [Task: {}]...", task.task_id);
     // let mut future_data = buf.cmd().map(Some(flags), None)
     //     .ewait(task.cmd_graph.get_req_events(2).unwrap())
     //     .enq_async().unwrap();
-    let mut data = buf.cmd().map(Some(flags), None)
-        .ewait(task.cmd_graph.get_req_events(2).unwrap())
+
+    let map_wait_events = task.cmd_graph.get_req_events(cmd_idx).unwrap();
+
+    println!("Enqueuing Map (Verify) [Task: {}, Buffer: {}]... Waiting on events: {:?}",
+        task.task_id, buffer_id, map_wait_events);
+
+    let mut data = buf.cmd().map().flags(flags)
+        .ewait(map_wait_events)
         .enq().unwrap();
 
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
 
     // let unmap_event = future_data.create_unmap_target().unwrap().clone();
     // println!("Setting command event for map [buffer_id: {}, cmd_idx: {}]. Event: {:?}.", buffer_id, cmd_idx, unmap_event);
@@ -966,7 +743,7 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
     //############################## AWAIT ####################################
     //#########################################################################
 
-    println!("Awaiting Data (Verify) [Task: {}]...", task_id);
+    println!("Awaiting Data (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
 
     // let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
     // let pooled_data = future_data.and_then(move |mut data| {
@@ -988,37 +765,41 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
     // });
     // let (mut data, vals_checked) = pooled_data.wait().unwrap();
 
+    // Ensure data buffer is equal to work size.
+    assert!(data.len() == task.work_size as usize);
 
-
-    println!("Verifying Data Values (Verify) [Task: {}].", task_id);
+    println!("Verifying Data Values (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
     let mut val_count = 0usize;
 
-    for val in data.iter() {
+    for (idx, val) in data[0..task.work_size as usize].iter().enumerate() {
         let correct_val = ClFloat4(150., 150., 150., 150.);
         if *val != correct_val {
-            panic!("Result value mismatch: {:?} != {:?}",
-                val, correct_val);
+            panic!("Result value mismatch: ({:?} != {:?}) at index: [{}]",
+                val, correct_val, idx);
         }
 
         *correct_val_count += 1
     }
 
-
-
     //#########################################################################
     //############################## UNMAP ####################################
     //#########################################################################
 
-    let mut ev = Event::empty();
-
-    println!("Enqueuing Unmap (Verify) [Task: {}]...", task_id);
-    data.enqueue_unmap(None, None::<Event>, Some(&mut ev)).unwrap();
-    // println!("Blocking on buffer queue.");
-    // buf.default_queue().finish();
-
-    println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.", task_id, buffer_id, cmd_idx, ev);
-    task.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+    /////// UNMAP & SET UNMAP EVENT [SYNC]:
+        // let mut new_event = Event::empty();
+        // println!("Enqueuing Unmap (Verify) [Task: {}]...", task_id);
+        // data.enqueue_unmap(None, None::<Event>, Some(&mut new_event)).unwrap();
+        // println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. \
+        //    Event: {:?}.", task_id, buffer_id, cmd_idx, new_event);
+        // task.cmd_graph.set_cmd_event(cmd_idx, new_event).unwrap();
+    ///////
+    /////// UNMAP ONLY (EVENT ALREADY SET) [ASYNC]:
+        println!("########### Enqueuing Unmap (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+        data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
+    ///////
 }
+
+
 
 
 
@@ -1085,24 +866,39 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 /// Creates a large number of both simple and complex asynchronous tasks and
 /// verifies that they all execute correctly.
 fn main() {
+    if SWITCHES.device_check {
+        return device_check::main();
+    }
+
     // Buffer/work size range:
     let buffer_size_range = RandRange::new(SUB_BUF_MIN_LEN, SUB_BUF_MAX_LEN);
     let mut rng = rand::weak_rng();
 
     // Set up context using defaults:
     let platform = Platform::default();
-    let device = Device::first(platform);
+    println!("Platform: {}", platform.name());
+
+    // let device = Device::first(platform);
+    let device_idx = 2;
+
+    let device = Device::specifier()
+        .wrapping_indices(vec![device_idx])
+        .to_device_list(Some(&platform)).unwrap()[0];
+
+    println!("Device: {} {}", device.vendor(), device.name());
+
     let context = Context::builder()
         .platform(platform)
         .devices(device)
         .build().unwrap();
 
-    // Out of order queues (coordinated by the command graph):
-    let io_queue = Queue::new(&context, device, Some(CommandQueueProperties::out_of_order())).unwrap();
-    let kern_queue = Queue::new(&context, device, Some(CommandQueueProperties::out_of_order())).unwrap();
+    // Queues (events coordinated by command graph):
+    let queue_flags = Some(SWITCHES.queue_ordering | CommandQueueProperties::profiling());
+    let io_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let kern_queue = Queue::new(&context, device, queue_flags).unwrap();
 
     let thread_pool = CpuPool::new_num_cpus();
-    let mut buf_pool: BufferPool<ClFloat4> = BufferPool::new(INITIAL_BUFFER_LEN, io_queue);
+    let mut buf_pool: BufferPool<ClFloat4> = BufferPool::new(INITIAL_BUFFER_LEN, io_queue.clone());
     // let mut simple_tasks: Vec<Task> = Vec::new();
     // let mut complex_tasks: Vec<Task> = Vec::new();
     let mut tasks: HashMap<usize, Task> = HashMap::new();
@@ -1173,6 +969,10 @@ fn main() {
     // for task in simple_tasks.iter_mut() {
     for task in tasks.values_mut() {
         initiate_simple_task(task, &buf_pool, &thread_pool);
+
+        // ////// DEBUG:
+        // io_queue.finish();
+        // kern_queue.finish();
     }
 
     // for task in complex_tasks.iter_mut() {
@@ -1187,15 +987,17 @@ fn main() {
     // for task in simple_tasks.iter_mut() {
     for task in tasks.values_mut() {
         verify_simple_task(task, &buf_pool, &thread_pool, &mut correct_val_count);
+
+        // ////// DEBUG:
+        // io_queue.finish();
+        // kern_queue.finish();
     }
 
     // for task in complex_tasks.iter_mut() {
     //     verify_complex_task(task, &buf_pool, &thread_pool, &mut correct_val_count);
     // }
 
-
     let verify_duration = chrono::Local::now() - start_time - create_duration - run_duration;
-
 
 
     let final_duration = chrono::Local::now() - start_time - create_duration - run_duration -
@@ -1205,7 +1007,7 @@ fn main() {
     //     Durations => | Create: {} | Run: {} | Verify: {} | ",
     //     correct_val_count, simple_tasks.len(), complex_tasks.len(), fmt_duration(create_duration),
     //     fmt_duration(run_duration), fmt_duration(verify_duration));
-    println!("All {} (float4) result values from {} tasks are correct! \n\
+    printlnc!(yellow_bold: "All {} (float4) result values from {} tasks are correct! \n\
         Durations => | Create: {} | Run: {} | Verify: {} | Final: {} | ",
         correct_val_count, tasks.len(), fmt_duration(create_duration),
         fmt_duration(run_duration), fmt_duration(verify_duration),
@@ -1243,7 +1045,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 
 //     // Map some memory for reading or writing.
 
-//     let (buffer_id, flags) = match task.cmd_graph.commands[cmd_idx].details {
+//     let (buffer_id, flags) = match task.cmd_graph.commands()[cmd_idx].details(){
 //         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
 //         CommandDetails::Read { source } => (source, MapFlags::read()),
 //         _ => panic!("Task::map: Not a write or read command."),
@@ -1293,7 +1095,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 //     // task.unmap(&mut data, 0, buf_pool);
 
 
-//     let buffer_id = match task.cmd_graph.commands[cmd_idx].details {
+//     let buffer_id = match task.cmd_graph.commands()[cmd_idx].details(){
 //         CommandDetails::Write { target } => target,
 //         CommandDetails::Read { source } => source,
 //         _ => panic!("Task::unmap: Not a write or read command."),

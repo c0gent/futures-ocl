@@ -225,8 +225,8 @@ impl Task{
             .ewait(self.cmd_graph.get_req_events(cmd_idx).unwrap())
             .enq().unwrap();
 
-        println!("Setting command completion event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. \
-            Event: {:?}.", self.task_id, kernel_id, cmd_idx, ev);
+        // println!("Setting command completion event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. \
+        //     Event: {:?}.", self.task_id, kernel_id, cmd_idx, ev);
 
         self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
     }
@@ -482,8 +482,6 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
 }
 
 
-
-
 //#############################################################################
 //#############################################################################
 //######################### INITIATE SIMPLE TASK ##############################
@@ -492,8 +490,6 @@ fn create_complex_task(task_id: usize, device: Device, context: &Context,
 
 
 fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
-    println!("Initiating simple task [Task: {}]...", task.task_id);
-
     // (0) Write a bunch of 50's:
     let cmd_idx = 0;
     let task_id = task.task_id;
@@ -512,174 +508,37 @@ fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread
 
     let mut map_event = Event::empty();
 
-    println!("Awaiting Data (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
-    /////// ASYNC:
-        let mut future_data: FutureMappedMem<ClFloat4> = buf.cmd().map().flags(flags)
-            .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-            .enew(&mut map_event)
-            .enq_async().unwrap();
+    let mut future_data: FutureMappedMem<ClFloat4> = buf.cmd().map().flags(flags)
+        .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
+        .enew(&mut map_event)
+        .enq_async().unwrap();
 
-        let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
-        println!("Setting command completion event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.",
-            task_id, buffer_id, cmd_idx, unmap_event_target);
-        task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
-    ///////
-    /////// SYNC:
-        // let mut data = buf.cmd().map().flags(flags)
-        //     .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-        //     .enew(&mut map_event)
-        //     .enq().unwrap();
-    ///////
-
-
-    // let user_map_event = UserEventCore::new(buf.default_queue().context_core()).unwrap();
-
-    // unsafe {
-    //     let unmap_target_ptr = user_map_event.into_raw();
-    //     map_event.set_callback(Some(core::_complete_user_event), unmap_target_ptr).unwrap();
-    // }
-
-
+    let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
+    task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
 
     //#########################################################################
-    //############################## AWAIT ####################################
+    //############################## WRITE ####################################
     //#########################################################################
 
-    println!("Awaiting Data (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
+    let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
+    // let pooled_data = future_data.and_then(move |mut data| {
 
-    //////// ASYNC (POOL):
-        // // let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
-        // let pooled_data = future_data.and_then(move |mut data| {
-        //     println!("Setting Data Values [Task: {}].", task_id);
-
-        //     for val in data.iter_mut() {
-        //         *val = ClFloat4(50., 50., 50., 50.);
-        //     }
-
-        //     Ok(data)
-        // // }));
-        // });
-
-        // let mut data = pooled_data.wait().unwrap();
-    ////////
-
-    //////// ASYNC (UNPOOLED):
-        // let map_event_status = core::event_status(&map_event).unwrap();
-        // printlnc!(dark_grey: "Map Event Status (Initiate) [Task: {}, Buffer: {}] (PRE-WAIT): {:?} -> {:?}",
-        //     task_id, buffer_id, map_event, map_event_status);
-
-        let mut data = future_data.wait().unwrap();
-
-        // let map_event_status = core::event_status(&map_event).unwrap();
-        // printlnc!(dark_grey: "Map Event Status (Initiate) [Task: {}, Buffer: {}] (POST-WAIT): {:?} -> {:?}",
-            // task_id, buffer_id, map_event, map_event_status);
-    ////////
-
-    /////// [---- LINCHPIN ----][---- LINCHPIN ----][---- LINCHPIN ----][AFFECTS MAP WRITE DATA]:
-        // buf.default_queue().finish();
-    ////////
-
-    //////// [OPTIONAL (EVENT)]:
-        //// THESE DO NOT BLOCK:
-        // map_event.wait_for().unwrap();
-        // user_map_event.wait_for().unwrap();
-    ////////
-
-    println!("Setting Data Values (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
-
-    // // Ensure data buffer is equal to work size.
-    // assert!(data.len() == task.work_size as usize);
-
-    for val in data.iter_mut() {
-        *val = ClFloat4(50., 50., 50., 50.);
-    }
-
-    for val in data.iter() {
-        if *val != ClFloat4(50., 50., 50., 50.) {
-            panic!("VAL = {:?}", *val);
+        for val in data.iter_mut() {
+            *val = ClFloat4(50., 50., 50., 50.);
         }
-    }
+
+        Ok(data)
+    }));
+    // });
+
+    let data = pooled_data.wait().unwrap();
 
     //#########################################################################
-    //############################## UNMAP ####################################
+    //############################# KERNEL ####################################
     //#########################################################################
-
-    //////////////////// PROBLEM IS NOT BELOW THIS LINE ///////////////////////
-    //       (but it must be adjusted based on what is set above)            //
-
-
-    /////// UNMAP & SET UNMAP EVENT [SYNC]:
-        // println!("Enqueuing Unmap (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
-        // let mut unmap_event = Event::empty();
-        // data.enqueue_unmap(None, None::<Event>, Some(&mut unmap_event)).unwrap();
-        // println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. \
-        //     Event: {:?}.", task_id, buffer_id, cmd_idx, unmap_event);
-        // task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.clone()).unwrap();
-    ///////
-
-    /////// UNMAP ONLY (EVENT ALREADY SET) [ASYNC]:
-        // println!("########### Enqueuing Unmap (Initiate) [Task: {}]...", task_id);
-        // data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
-    ///////
-
-    /////// EXPERIMENTALLY CREATE UNMAP EVENT DOWN HERE [ASYNC] (WON'T WORK because future is gone):
-        // let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
-        // println!("Setting command completion event for map [task: {}, buffer_id: {}, cmd_idx: {}]. Event: {:?}.",
-        //     task_id, buffer_id, cmd_idx, unmap_event_target);
-        // task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
-    ///////
-
-    /////// [---- LINCHPIN ----][AFFECTS KERNEL DATA]:
-        // buf.default_queue().finish();
-    ///////
-
-
-    //#########################################################################
-    //############################## KERNEL ###################################
-    //#########################################################################
-
-    //////////////////// PROBLEM IS NOT BELOW THIS LINE ///////////////////////
 
     // (1) Run kernel (adds 100 to everything):
-    println!("Enqueuing Kernel (Initiate) [Task: {}, Buffer: {}]...", task_id, buffer_id);
     task.kernel(1);
-
-    // let cmd_idx = 1;
-
-    // let kernel_id = match *task.cmd_graph.commands()[cmd_idx].details(){
-    //     CommandDetails::Kernel { id, .. } => id,
-    //     _ => panic!("Task::kernel: Not a kernel command."),
-    // };
-
-    // let kernel = &task.kernels[kernel_id];
-
-    // /////// [OPTIONAL (NO EFFECT)]:
-    //     // kernel.default_queue().finish();
-    // ///////
-
-    // let enew = {
-    //     /////// [NO EFFECT]:
-    //         let ewait = task.cmd_graph.get_req_events(cmd_idx).unwrap();
-    //         // let ewait = &unmap_event;
-    //     ///////
-
-    //     let mut enew = Event::empty();
-
-    //     println!("Enqueuing Kernel (Initiate) [Task: {}, Buffer: {}]: \n\
-    //         - Wait Events: {:?}", task_id, buffer_id, ewait);
-
-    //     kernel.cmd()
-    //         .ewait(ewait)
-    //         .enew(&mut enew)
-    //         .enq().unwrap();
-
-    //     println!("Setting command completion event for kernel [task: {}, kernel_id: {}, cmd_idx: {}]. \
-    //         Event: {:?}.", task.task_id, kernel_id, cmd_idx, enew);
-
-    //     enew
-    // };
-
-    // task.cmd_graph.set_cmd_event(cmd_idx, enew).unwrap();
 }
 
 
@@ -692,9 +551,6 @@ fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread
 fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
         correct_val_count: &mut usize)
 {
-
-    println!("\n\nVerifying simple task...");
-
     // (2) Read results and verify them:
     let cmd_idx = 2;
     let task_id = task.task_id;
@@ -712,37 +568,19 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 
     let buf = buf_pool.get(buffer_id).unwrap();
 
-    /////// [NO EFFECT]:
-        // buf.default_queue().finish();
-    ///////
-
-    // println!("Enqueuing Map (Verify) [Task: {}]...", task.task_id);
     let mut future_data = buf.cmd().map().flags(flags)
         .ewait(task.cmd_graph.get_req_events(2).unwrap())
         .enq_async().unwrap();
 
-    // let map_wait_events = task.cmd_graph.get_req_events(cmd_idx).unwrap();
-    // println!("Enqueuing Map (Verify) [Task: {}, Buffer: {}]... Waiting on events: {:?}",
-    //     task.task_id, buffer_id, map_wait_events);
-
-    // let mut data = buf.cmd().map().flags(flags)
-    //     .ewait(map_wait_events)
-    //     .enq().unwrap();
-
-
     let unmap_event = future_data.create_unmap_event().unwrap().clone();
-    println!("Setting command event for map [buffer_id: {}, cmd_idx: {}]. Event: {:?}.", buffer_id, cmd_idx, unmap_event);
     task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
 
     //#########################################################################
-    //############################## AWAIT ####################################
+    //############################## READ #####################################
     //#########################################################################
-
-    println!("Awaiting Data (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
 
     // let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
     let pooled_data = future_data.and_then(move |mut data| {
-        println!("Verifying Data Values [Task: {}].", task_id);
         let mut val_count = 0usize;
 
         for val in data.iter() {
@@ -761,41 +599,12 @@ fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_p
 
     let (mut data, vals_checked) = pooled_data.wait().unwrap();
 
-    // // Ensure data buffer is equal to work size.
-    // assert!(data.len() == task.work_size as usize);
-
-    // println!("Verifying Data Values (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
-    // let mut val_count = 0usize;
-
-    // for (idx, val) in data[0..task.work_size as usize].iter().enumerate() {
-    //     let correct_val = ClFloat4(150., 150., 150., 150.);
-    //     if *val != correct_val {
-    //         panic!("Result value mismatch: ({:?} != {:?}) at index: [{}]",
-    //             val, correct_val, idx);
-    //     }
-
-    //     *correct_val_count += 1
-    // }
-
     //#########################################################################
     //############################## UNMAP ####################################
     //#########################################################################
 
-    /////// UNMAP & SET UNMAP EVENT [SYNC]:
-        // let mut new_event = Event::empty();
-        // println!("Enqueuing Unmap (Verify) [Task: {}]...", task_id);
-        // data.enqueue_unmap(None, None::<Event>, Some(&mut new_event)).unwrap();
-        // println!("Setting command event for map [task: {}, buffer_id: {}, cmd_idx: {}]. \
-        //    Event: {:?}.", task_id, buffer_id, cmd_idx, new_event);
-        // task.cmd_graph.set_cmd_event(cmd_idx, new_event).unwrap();
-    ///////
-    /////// UNMAP ONLY (EVENT ALREADY SET) [ASYNC]:
-        println!("########### Enqueuing Unmap (Verify) [Task: {}, Buffer: {}]...", task_id, buffer_id);
-        data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
-    ///////
+    data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
 }
-
-
 
 
 
@@ -959,16 +768,11 @@ fn main() {
     let create_duration = chrono::Local::now() - start_time;
     let mut correct_val_count = 0usize;
 
-
     println!("Enqueuing tasks...");
 
     // for task in simple_tasks.iter_mut() {
     for task in tasks.values_mut() {
         initiate_simple_task(task, &buf_pool, &thread_pool);
-
-        // ////// DEBUG:
-        // io_queue.finish();
-        // kern_queue.finish();
     }
 
     // for task in complex_tasks.iter_mut() {
@@ -977,16 +781,11 @@ fn main() {
 
     let run_duration = chrono::Local::now() - start_time - create_duration;
 
-
-    // println!("Reading and verifying task results...");
+    println!("Reading and verifying task results...");
 
     // for task in simple_tasks.iter_mut() {
     for task in tasks.values_mut() {
         verify_simple_task(task, &buf_pool, &thread_pool, &mut correct_val_count);
-
-        // ////// DEBUG:
-        // io_queue.finish();
-        // kern_queue.finish();
     }
 
     // for task in complex_tasks.iter_mut() {
@@ -994,7 +793,6 @@ fn main() {
     // }
 
     let verify_duration = chrono::Local::now() - start_time - create_duration - run_duration;
-
 
     let final_duration = chrono::Local::now() - start_time - create_duration - run_duration -
         verify_duration;

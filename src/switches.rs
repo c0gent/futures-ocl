@@ -17,7 +17,7 @@ pub struct Switches {
 
 lazy_static! {
     pub static ref SWITCHES: Switches = Switches {
-        device_check: true,
+        device_check: false,
         // device_check: false,
 
         // queue_ordering: CommandQueueProperties::empty(),

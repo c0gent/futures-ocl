@@ -12,9 +12,6 @@
 //!
 //!
 
-
-#![allow(dead_code, unused_variables, unused_assignments, unused_imports, unused_mut, deprecated)]
-
 use std::fmt::{Display, Debug};
 use std::ops::Add;
 use libc::c_void;
@@ -186,7 +183,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: false,
         },
 
@@ -215,7 +212,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: true,
         },
 
@@ -244,7 +241,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: false,
         },
 
@@ -273,7 +270,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: false,
         },
 
@@ -302,7 +299,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: false,
         },
 
@@ -331,7 +328,7 @@ lazy_static! {
         },
         misc: Misc {
             // work_size_range: ((2 << 24) - 1, 2 << 24),
-            work_size_range: (2 << 23, 2 << 24),
+            work_size_range: (2 << 21, 2 << 22),
             alloc_host_ptr: false,
         },
 
@@ -409,19 +406,18 @@ pub fn check(device: Device, context: &Context, rng: &mut XorShiftRng, cfg: Swit
 
     if cfg.map_write {
         //###################### cfg.MAP_WRITE ############################
-        let mut map_event = Event::empty();
 
         let mut mapped_mem = if cfg.futures {
             let mut future_mem = source_buf.cmd().map()
                 .flags(MapFlags::write_invalidate_region())
                 // .flags(MapFlags::write())
                 .ewait(&wait_events)
-                .enew(&mut map_event)
+                // .enew(&mut map_event)
                 .enq_async()?;
 
-            if let Some(tar_ev) = wire_callback(cfg.event_callback, context, &mut map_event) {
-                map_event = tar_ev;
-            }
+            // if let Some(tar_ev) = wire_callback(cfg.event_callback, context, &mut map_event) {
+            //     map_event = tar_ev;
+            // }
 
             // // Print map event status:
             // printlnc!(dark_grey: "    Map Event Status (PRE-wait) : {:?} => {:?}",
@@ -435,6 +431,8 @@ pub fn check(device: Device, context: &Context, rng: &mut XorShiftRng, cfg: Swit
             // Wait for event completion:
             future_mem.wait()?
         } else {
+            let mut map_event = Event::empty();
+
             let new_mm = unsafe {
                 let mm_core = core::enqueue_map_buffer::<ClFloat4, _, _, _>(
                     source_buf.default_queue(),
@@ -661,8 +659,8 @@ pub fn main() {
     let thread_pool = CpuPool::new_num_cpus();
     let mut rng = rand::weak_rng();
 
-    // for platform in Platform::list() {
-    for &platform in &[Platform::default()] {
+    for platform in Platform::list() {
+    // for &platform in &[Platform::default()] {
 
         let devices = Device::list_all(&platform).unwrap();
 

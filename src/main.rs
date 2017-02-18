@@ -143,7 +143,7 @@ impl Task{
     }
 
     /// Fill a buffer with a pattern of data:
-    pub fn fill<T: OclPrm>(&mut self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>)
+    pub fn fill<T: OclPrm>(&self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>)
             -> FutureAsyncResult<()>
     {
         let buffer_id = match *self.cmd_graph.commands()[cmd_idx].details() {
@@ -165,7 +165,7 @@ impl Task{
     }
 
     /// Map some memory for reading or writing.
-    pub fn map<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>,
+    pub fn map<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &BufferPool<T>,
             /*thread_pool: &CpuPool*/) -> FutureMemMap<T>
     {
         let (buffer_id, flags) = match *self.cmd_graph.commands()[cmd_idx].details(){
@@ -204,7 +204,7 @@ impl Task{
     // }
 
     /// Copy contents of one buffer to another.
-    pub fn copy<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>)
+    pub fn copy<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &BufferPool<T>)
              -> FutureAsyncResult<()>
     {
         let (src_buf_id, tar_buf_id) = match *self.cmd_graph.commands()[cmd_idx].details(){
@@ -234,7 +234,7 @@ impl Task{
     //#############################################################################
 
     /// Enqueue a kernel.
-    pub fn kernel(&mut self, cmd_idx: usize) -> FutureAsyncResult<()> {
+    pub fn kernel(&self, cmd_idx: usize) -> FutureAsyncResult<()> {
         let kernel_id = match *self.cmd_graph.commands()[cmd_idx].details(){
             CommandDetails::Kernel { id, .. } => id,
             _ => panic!("Task::kernel: Not a kernel command."),
@@ -573,7 +573,7 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
 
 // fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
 //         mut tx: Sender<usize>)
-fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, handle: &Handle,
+fn enqueue_simple_task(task: &Task, buf_pool: &BufferPool<ClFloat4>, handle: &Handle,
         mut tx: Sender<usize>)
 {
     // (0) Write a bunch of 50's:
@@ -624,7 +624,7 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, handle:
                 *val = ClFloat4(50., 50., 50., 50.);
             }
 
-            println!("Data has been written.");
+            print!("Data has been written. ");
 
             Ok(())
         })
@@ -651,7 +651,7 @@ fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, handle:
                 val_count += 1;
             }
 
-            println!("Verify done.");
+            print!("Verify done. ");
 
             Ok(val_count)
         })
@@ -760,7 +760,8 @@ fn main() {
             // simple_tasks.push(task);
 
             // Add task to the list:
-            Rc::new(tasks.insert(task_id, task));
+            // Rc::new(tasks.insert(task_id, task));
+            tasks.insert(task_id, task);
         }
 
         // // Add 5 complex tasks:
@@ -810,6 +811,8 @@ fn main() {
             TaskKind::Complex => (),
         }
     }
+
+    print!("\n");
 
     let _ = tx;
 

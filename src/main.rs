@@ -3,6 +3,7 @@
 extern crate libc;
 extern crate futures;
 extern crate futures_cpupool;
+extern crate tokio_core;
 extern crate tokio_timer;
 extern crate rand;
 extern crate chrono;
@@ -14,22 +15,27 @@ mod extras;
 mod switches;
 
 // use std::io;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use libc::c_void;
-use futures::{future, Async};
+use futures::{future, stream, Async, Sink, Stream};
 use futures::future::*;
+use futures::sync::mpsc::{self, Receiver, Sender};
 use futures_cpupool::{CpuPool, CpuFuture};
+use tokio_core::reactor::{Core, Handle};
 use tokio_timer::{Timer, Sleep, TimerError};
 // use self::dinglehopper::Dinglehopper;
 
 use rand::{Rng, XorShiftRng};
 use rand::distributions::{IndependentSample, Range as RandRange};
 use std::collections::{LinkedList, HashMap, BTreeSet};
-use ocl::{core, Platform, Device, Context, Queue, Program, Buffer, Kernel, SubBuffer, OclPrm,
-    Event, EventList, FutureMappedMem, MappedMem};
-// use ocl::core::{FutureMappedMem, MappedMem};
+use ocl::{core, async, Platform, Device, Context, Queue, Program, Buffer, Kernel, SubBuffer, OclPrm,
+    Event, EventList, FutureMemMap, MemMap, Error as OclError};
+// use ocl::core::{FutureMemMap, MemMap};
 use ocl::flags::{MemFlags, MapFlags, CommandQueueProperties};
 use ocl::aliases::ClFloat4;
+use ocl::async::{FutureResult as FutureAsyncResult};
 
 use extras::{BufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
 use switches::{Switches, SWITCHES};
@@ -137,7 +143,9 @@ impl Task{
     }
 
     /// Fill a buffer with a pattern of data:
-    pub fn fill<T: OclPrm>(&mut self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>) {
+    pub fn fill<T: OclPrm>(&mut self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>)
+            -> FutureAsyncResult<()>
+    {
         let buffer_id = match *self.cmd_graph.commands()[cmd_idx].details() {
             CommandDetails::Fill { target } => target,
             _ => panic!("Task::fill: Not a fill command."),
@@ -152,29 +160,34 @@ impl Task{
             .enq().unwrap();
 
         self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+
+        future::ok(())
     }
 
-    // /// Map some memory for reading or writing.
-    // pub fn map<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>,
-    //         thread_pool: &CpuPool) -> FutureMappedMem<T>
-    // {
-    //     let (buffer_id, flags) = match self.cmd_graph.commands()[cmd_idx].details(){
-    //         CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
-    //         CommandDetails::Read { source } => (source, MapFlags::read()),
-    //         _ => panic!("Task::map: Not a write or read command."),
-    //     };
+    /// Map some memory for reading or writing.
+    pub fn map<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>,
+            /*thread_pool: &CpuPool*/) -> FutureMemMap<T>
+    {
+        let (buffer_id, flags) = match *self.cmd_graph.commands()[cmd_idx].details(){
+            CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
+            CommandDetails::Read { source } => (source, MapFlags::read()),
+            _ => panic!("Task::map: Not a write or read command."),
+        };
 
-    //     let buf = buf_pool.get(buffer_id).unwrap();
+        let buf = buf_pool.get(buffer_id).unwrap();
 
-    //     let future = buf.cmd().map(Some(flags), None)
-    //         .ewait(self.cmd_graph.get_req_events(cmd_idx).unwrap())
-    //         .enq_map_async().unwrap();
+        let mut future_data = buf.cmd().map().flags(flags)
+            .ewait(self.cmd_graph.get_req_events(cmd_idx).unwrap())
+            .enq_async().unwrap();
 
-    //     future
-    // }
+        let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
+        self.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
+
+        future_data
+    }
 
     // /// Unmap mapped memory.
-    // pub fn unmap<T: OclPrm>(&mut self, data: &mut MappedMem<T>, cmd_idx: usize,
+    // pub fn unmap<T: OclPrm>(&mut self, data: &mut MemMap<T>, cmd_idx: usize,
     //         buf_pool: &BufferPool<T>)
     // {
     //     let buffer_id = match self.cmd_graph.commands()[cmd_idx].details(){
@@ -191,7 +204,9 @@ impl Task{
     // }
 
     /// Copy contents of one buffer to another.
-    pub fn copy<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>) {
+    pub fn copy<T: OclPrm>(&mut self, cmd_idx: usize, buf_pool: &BufferPool<T>)
+             -> FutureAsyncResult<()>
+    {
         let (src_buf_id, tar_buf_id) = match *self.cmd_graph.commands()[cmd_idx].details(){
             CommandDetails::Copy { source, target } => (source, target),
             _ => panic!("Task::copy: Not a copy command."),
@@ -207,6 +222,8 @@ impl Task{
             .enq().unwrap();
 
         self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+
+        future::ok(())
     }
 
 
@@ -217,7 +234,7 @@ impl Task{
     //#############################################################################
 
     /// Enqueue a kernel.
-    pub fn kernel(&mut self, cmd_idx: usize) {
+    pub fn kernel(&mut self, cmd_idx: usize) -> FutureAsyncResult<()> {
         let kernel_id = match *self.cmd_graph.commands()[cmd_idx].details(){
             CommandDetails::Kernel { id, .. } => id,
             _ => panic!("Task::kernel: Not a kernel command."),
@@ -233,6 +250,8 @@ impl Task{
         //     Event: {:?}.", self.task_id, kernel_id, cmd_idx, ev);
 
         self.cmd_graph.set_cmd_event(cmd_idx, ev).unwrap();
+
+        future::ok(())
     }
 }
 
@@ -552,123 +571,115 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
 
 
 
-fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
-    // (0) Write a bunch of 50's:
-    let cmd_idx = 0;
-    let task_id = task.task_id;
-
-    //#########################################################################
-    //############################### MAP #####################################
-    //#########################################################################
-
-    let (buffer_id, flags) = match *task.cmd_graph.commands()[cmd_idx].details(){
-        CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
-        CommandDetails::Read { source } => (source, MapFlags::read()),
-        _ => panic!("Task::map: Not a write or read command."),
-    };
-
-    let buf = buf_pool.get(buffer_id).unwrap();
-
-    let mut map_event = Event::empty();
-
-    let mut future_data: FutureMappedMem<ClFloat4> = buf.cmd().map().flags(flags)
-        .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
-        .enew(&mut map_event)
-        .enq_async().unwrap();
-
-    let unmap_event_target = future_data.create_unmap_event().unwrap().clone();
-    task.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
-
-    //#########################################################################
-    //############################## WRITE ####################################
-    //#########################################################################
-
-    let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
-        for val in data.iter_mut() {
-            *val = ClFloat4(50., 50., 50., 50.);
-        }
-
-        Ok(data)
-    }));
-
-    let data = pooled_data.wait().unwrap();
-
-    //#########################################################################
-    //############################# KERNEL ####################################
-    //#########################################################################
-
-    // (1) Run kernel (adds 100 to everything):
-    task.kernel(1);
-}
-
-
-
-fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
-        correct_val_count: &mut usize)
+// fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
+//         mut tx: Sender<usize>)
+fn enqueue_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, handle: &Handle,
+        mut tx: Sender<usize>)
 {
-    // (2) Read results and verify them:
-    let cmd_idx = 2;
-    let task_id = task.task_id;
+    // (0) Write a bunch of 50's:
+    // thread_pool.spawn(task.map(0, buf_pool)
+    //     .and_then(move |mut data| {
+    //         for val in data.iter_mut() {
+    //             *val = ClFloat4(50., 50., 50., 50.);
+    //         }
 
-    //#########################################################################
-    //############################### MAP #####################################
-    //#########################################################################
+    //         println!("Data has been written.");
 
-    // (2) Read results and verify them:
-    let (buffer_id, flags) = match *task.cmd_graph.commands()[cmd_idx].details(){
-        CommandDetails::Write { target } => (target, MapFlags::write_invalidate_region()),
-        CommandDetails::Read { source } => (source, MapFlags::read()),
-        _ => panic!("Task::map: Not a write or read command."),
-    };
+    //         Ok(())
+    //     })
+    // ).forget();
+    // // ).wait().unwrap();
 
-    let buf = buf_pool.get(buffer_id).unwrap();
+    // // (1) Run kernel (adds 100 to everything):
+    // task.kernel(1)
 
-    let mut future_data = buf.cmd().map().flags(flags)
-        .ewait(task.cmd_graph.get_req_events(2).unwrap())
-        .enq_async().unwrap();
+    // // (2) Read results and verify them:
+    // thread_pool.spawn(task.map(2, buf_pool)
+    //     .and_then(move |mut data| {
+    //         let mut val_count = 0usize;
 
-    let unmap_event = future_data.create_unmap_event().unwrap().clone();
-    task.cmd_graph.set_cmd_event(cmd_idx, unmap_event.into()).unwrap();
+    //         for val in data.iter() {
+    //             let correct_val = ClFloat4(150., 150., 150., 150.);
+    //             if *val != correct_val {
+    //                 return Err(format!("Result value mismatch: {:?} != {:?}", val, correct_val).into())
+    //             }
+    //             val_count += 1;
+    //         }
 
-    //#########################################################################
-    //############################## READ #####################################
-    //#########################################################################
+    //         println!("Verify done.");
 
-    let pooled_data = thread_pool.spawn(future_data.and_then(move |mut data| {
-    // let pooled_data = future_data.and_then(move |mut data| {
-        let mut val_count = 0usize;
+    //         Ok(val_count)
+    //     })
+    //     .and_then(move |val_count| {
+    //         Ok(tx.send(val_count))
+    //     })
+    // // ).forget();
+    // ).wait().unwrap().wait().unwrap();
 
-        for val in data.iter() {
-            let correct_val = ClFloat4(150., 150., 150., 150.);
-            if *val != correct_val {
-                return Err(format!("Result value mismatch: {:?} != {:?}",
-                    val, correct_val).into())
+
+    // (0) Write a bunch of 50's:
+    task.map(0, buf_pool)
+        .and_then(move |mut data| {
+            for val in data.iter_mut() {
+                *val = ClFloat4(50., 50., 50., 50.);
             }
 
-            val_count += 1;
-        }
+            println!("Data has been written.");
 
-        Ok((data, val_count))
-    }));
-    // });
+            Ok(())
+        })
+        // .then(|_| Ok(()))
+        .wait().unwrap();
 
-    let (mut data, vals_checked) = pooled_data.wait().unwrap();
-    *correct_val_count += vals_checked;
+    // (1) Run kernel (adds 100 to everything):
+    task.kernel(1)
+        // .then(|_| Ok(()))
+        .wait().unwrap();
+
+
+
+    // (2) Read results and verify them:
+    task.map(2, buf_pool)
+        .and_then(move |mut data| {
+            let mut val_count = 0usize;
+
+            for val in data.iter() {
+                let correct_val = ClFloat4(150., 150., 150., 150.);
+                if *val != correct_val {
+                    return Err(format!("Result value mismatch: {:?} != {:?}", val, correct_val).into())
+                }
+                val_count += 1;
+            }
+
+            println!("Verify done.");
+
+            Ok(val_count)
+        })
+        .and_then(move |val_count| {
+            Ok(tx.send(val_count))
+        })
+        // .then(|res| { res.unwrap(); Ok(()) })
+        .wait().unwrap()
+        .wait().unwrap();
+
+
+
+
+    // println!("Task[{}], Command[2] (map) has been spawned.", task.task_id);
+
+
+    // let (mut data, vals_checked) = pooled_data.wait().unwrap();
+    // *correct_val_count += vals_checked;
 
     //#########################################################################
     //############################## UNMAP ####################################
     //#########################################################################
 
-    data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
+    // data.enqueue_unmap(None, None::<Event>, None::<&mut Event>).unwrap();
 
-    task.get_finish_events();
-    assert!(task.finish_events.len() == 1);
+    // task.get_finish_events();
+    // assert!(task.finish_events.len() == 1);
 }
-
-
-
-
-
 
 
 
@@ -714,6 +725,8 @@ fn main() {
     let kern_queue = Queue::new(&context, device, queue_flags).unwrap();
 
     let thread_pool = CpuPool::new_num_cpus();
+    // let mut core = Core::new().unwrap();
+    // let handle = core.handle();
     let mut buf_pool: BufferPool<ClFloat4> = BufferPool::new(INITIAL_BUFFER_LEN, io_queue.clone());
     // let mut simple_tasks: Vec<Task> = Vec::new();
     // let mut complex_tasks: Vec<Task> = Vec::new();
@@ -747,7 +760,7 @@ fn main() {
             // simple_tasks.push(task);
 
             // Add task to the list:
-            tasks.insert(task_id, task);
+            Rc::new(tasks.insert(task_id, task));
         }
 
         // // Add 5 complex tasks:
@@ -776,50 +789,68 @@ fn main() {
         // }
     }
 
-    let create_duration = chrono::Local::now() - start_time;
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+
     let mut correct_val_count = 0usize;
+    let (tx, mut rx) = mpsc::channel(1);
+
+    let create_duration = chrono::Local::now() - start_time;
 
     println!("Enqueuing tasks...");
+    println!("Reading and verifying task results...");
+
+    // let future_tasks = ;
 
     for task in tasks.values_mut() {
         match task.kind {
-            TaskKind::Simple => initiate_simple_task(task, &buf_pool, &thread_pool),
+            // TaskKind::Simple => enqueue_simple_task(task, &buf_pool, &thread_pool, tx.clone()),
+            TaskKind::Simple => enqueue_simple_task(task, &buf_pool, &handle, tx.clone()),
             // TaskKind::Complex => enqueue_complex_task(task, &buf_pool, &thread_pool),
             TaskKind::Complex => (),
         }
     }
 
-    let run_duration = chrono::Local::now() - start_time - create_duration;
+    let _ = tx;
 
-    println!("Reading and verifying task results...");
+    let enqueue_duration = chrono::Local::now() - start_time - create_duration;
 
-    for task in tasks.values_mut() {
-        match task.kind {
-            TaskKind::Simple => verify_simple_task(task, &buf_pool, &thread_pool, &mut correct_val_count),
-            // TaskKind::Complex => verify_complex_task(task, &buf_pool, &thread_pool, &mut correct_val_count),
-            TaskKind::Complex => (),
-        }
+    // correct_val_count = thread_pool.spawn(rx.for_each(|val| {
+
+    //         future::ok(())
+    //     })).wait().unwrap();
+
+    // for count in rx.wait() {
+    //     println!("Count: {}", count.unwrap());
+    // }
+
+    // core.run(futur);
+
+    rx.close();
+
+    for count in rx.wait() {
+        // println!("Count: {}", count.unwrap());
+        correct_val_count += count.unwrap();
     }
 
-    let verify_duration = chrono::Local::now() - start_time - create_duration - run_duration;
+    let run_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration;
 
-    for task in tasks.values() {
+    // for task in tasks.values() {
 
-        // let (mut data, vals_checked) = pooled_data.wait().unwrap();
-        // correct_val_count += vals_checked;
-    }
+    //     // let (mut data, vals_checked) = pooled_data.wait().unwrap();
+    //     // correct_val_count += vals_checked;
+    // }
 
-    let final_duration = chrono::Local::now() - start_time - create_duration - run_duration -
-        verify_duration;
+    let final_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration - run_duration;
 
     // println!("All {} (float4) result values from {} simple and {} complex tasks are correct! \n\
     //     Durations => | Create: {} | Run: {} | Verify: {} | ",
     //     correct_val_count, simple_tasks.len(), complex_tasks.len(), fmt_duration(create_duration),
     //     fmt_duration(run_duration), fmt_duration(verify_duration));
     printlnc!(yellow_bold: "All {} (float4) result values from {} tasks are correct! \n\
-        Durations => | Create: {} | Run: {} | Verify: {} | Final: {} | ",
+        Durations => | Create: {} | Enqueue: {} | Run: {} | Final: {} | ",
         correct_val_count, tasks.len(), fmt_duration(create_duration),
-        fmt_duration(run_duration), fmt_duration(verify_duration),
+        fmt_duration(enqueue_duration), fmt_duration(run_duration),
         fmt_duration(final_duration));
 }
 
@@ -925,7 +956,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 
 //     let mut map_event = Event::empty();
 
-//     let mut future_data: FutureMappedMem<ClFloat4> = buf.cmd().map().flags(flags)
+//     let mut future_data: FutureMemMap<ClFloat4> = buf.cmd().map().flags(flags)
 //         .ewait(task.cmd_graph.get_req_events(cmd_idx).unwrap())
 //         .enew(&mut map_event)
 //         .enq_async().unwrap();

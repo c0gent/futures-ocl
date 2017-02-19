@@ -12,8 +12,8 @@ extern crate ocl;
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate colorify;
 
-mod extras;
-mod switches;
+// mod extras;
+// mod switches;
 
 use std::io::Write;
 // use std::thread;
@@ -25,7 +25,7 @@ use crossbeam::sync::MsQueue;
 use futures::{future, stream, Async, Sink, Stream};
 use futures::future::*;
 use futures::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
-use futures_cpupool::{CpuPool, CpuFuture};
+use futures_cpupool::{CpuPool, CpuFuture, Builder};
 use tokio_core::reactor::{Core, Handle};
 use tokio_timer::{Timer, Sleep, TimerError};
 
@@ -38,8 +38,8 @@ use ocl::flags::{MemFlags, MapFlags, CommandQueueProperties};
 use ocl::aliases::ClFloat4;
 use ocl::async::{FutureResult as FutureAsyncResult, Error as AsyncError};
 
-use extras::{BufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
-use switches::{Switches, SWITCHES};
+// use extras::{BufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
+// use switches::{Switches, SWITCHES};
 
 const INITIAL_BUFFER_LEN: u32 = 2 << 23; // 256MiB of ClFloat4
 const SUB_BUF_MIN_LEN: u32 = 2 << 11; // 64KiB of ClFloat4
@@ -90,9 +90,14 @@ pub fn main() {
         .devices(device)
         .build().unwrap();
 
-    let queue_flags = Some(SWITCHES.queue_flags);
-    let io_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let queue_flags = Some(CommandQueueProperties::out_of_order());
+    // let queue_flags = None;
+    // let io_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let write_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let read_queue = Queue::new(&context, device, queue_flags).unwrap();
     let kern_queue = Queue::new(&context, device, queue_flags).unwrap();
+    // let kern_queue = io_queue.clone();
+
 
     // let mut buf_pool: BufferPool<ClFloat4> = BufferPool::new(INITIAL_BUFFER_LEN, io_queue.clone());
     // let mut pool_full = false;
@@ -100,8 +105,20 @@ pub fn main() {
     let start_time = chrono::Local::now();
     println!("Creating tasks...");
 
+    // // Queues for the thread pool.
+    // let io_queue_tp = io_queue.clone();
+    // let kern_queue_tp = io_queue.clone();
 
     let thread_pool = CpuPool::new_num_cpus();
+    // let thread_pool = Builder::new()
+    //     .pool_size(2)
+    //     .name_prefix("future-pool-")
+    //     .before_stop(move || {
+    //         io_queue_tp.finish().unwrap();
+    //         kern_queue_tp.finish().unwrap();
+    //     })
+    //     .create();
+
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     // let remote  = core.remote();
@@ -121,9 +138,9 @@ pub fn main() {
         let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only());
         let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only());
 
-        let write_buf: Buffer<ClFloat4> = Buffer::new(io_queue.clone(),
+        let write_buf: Buffer<ClFloat4> = Buffer::new(write_queue.clone(),
             write_buf_flags, work_size, None).unwrap();
-        let read_buf: Buffer<ClFloat4> = Buffer::new(io_queue.clone(),
+        let read_buf: Buffer<ClFloat4> = Buffer::new(read_queue.clone(),
             read_buf_flags, work_size, None).unwrap();
 
         let program = Program::builder()
@@ -159,21 +176,32 @@ pub fn main() {
 
                 println!("Data has been written. ");
 
-                data.enqueue_unmap::<(), ()>(None, None, None).unwrap();
+                let mut unmap_event = Event::empty();
+
+                data.enqueue_unmap::<(), _>(None, None, Some(&mut unmap_event)).unwrap();
+
+                // if let Some(unmap_event) = data.get_unmap_target() {
+                //     unmap_event.wait_for().unwrap();
+                // }
+                // core::finish(data.queue()).unwrap();
+                // unmap_event.wait_for().unwrap();
+                // println!("Unmap is complete.");
 
                 Ok(())
             })
                 // .then(|_| Ok::<_, ()>(()))
-            // .wait().unwrap();
         ;
-
-        let spawned_write = thread_pool.spawn(write);
-
-        io_queue.finish().unwrap();
-        println!("I/O queue finished.");
 
         // write.wait().unwrap();
         // thread_pool.spawn(write).wait().unwrap();
+        let spawned_write = thread_pool.spawn(write);
+
+        // io_queue.finish().unwrap();
+        // println!("I/O queue finished.");
+
+        // io_queue.flush().unwrap();
+        // println!("I/O queue flushed.");
+
 
         // (1) KERNEL: Run kernel (adds 100 to everything):
         let mut kern_event = Event::empty();
@@ -184,17 +212,19 @@ pub fn main() {
             .enq().unwrap();
 
         // kern_queue.flush().unwrap();
+        // io_queue.flush().unwrap();
         // println!("Kernel queue flushed.");
 
-        kern_queue.finish().unwrap();
-        println!("Kernel queue finished.");
+        // println!("Attempting to finish kernel queue...");
+        // kern_queue.finish().unwrap();
+        // println!("Kernel queue finished.");
 
         // (2) READ: Read results and verify them:
         let mut future_read_data = read_buf.cmd().map().flags(MapFlags::read())
             .ewait(&kern_event)
             .enq_async().unwrap();
 
-        let unmap_event = future_read_data.create_unmap_event().unwrap().clone();
+        // let unmap_event = future_read_data.create_unmap_event().unwrap().clone();
         // self.cmd_graph.set_cmd_event(cmd_idx, unmap_event_target.into()).unwrap();
 
         let tx_c = tx.clone();
@@ -225,8 +255,9 @@ pub fn main() {
             .and_then(|_| Ok(()))
         ;
 
-        io_queue.finish().unwrap();
-        println!("I/O queue finished.");
+        // println!("Attempting to finish I/O queue...");
+        // io_queue.finish().unwrap();
+        // println!("I/O queue finished.");
 
         // verify.wait().unwrap();
         // thread_pool.spawn(verify).wait().unwrap();
@@ -235,8 +266,9 @@ pub fn main() {
         let offload = spawned_write.join(spawned_verify);
 
         offloads.push(offload);
+        // offloads.push(verify);
 
-        print!("[.] ");
+        print!("[O] ");
         std::io::stdout().flush().unwrap();
     }
 
@@ -246,8 +278,8 @@ pub fn main() {
 
     print!("\n");
 
-    kern_queue.flush().unwrap();
-    io_queue.flush().unwrap();
+    // kern_queue.flush().unwrap();
+    // io_queue.flush().unwrap();
 
     let enqueue_duration = chrono::Local::now() - start_time - create_duration;
 

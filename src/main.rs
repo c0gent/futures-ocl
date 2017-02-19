@@ -132,7 +132,7 @@ pub fn main() {
 
     println!("Enqueuing tasks...");
 
-    for _ in 0..4 {
+    for _ in 0..8 {
         let work_size = 2 << 15;
 
         let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only());
@@ -153,7 +153,6 @@ pub fn main() {
             .arg_buf(&write_buf)
             .arg_vec(ClFloat4(100., 100., 100., 100.))
             .arg_buf(&read_buf);
-
 
         // (-1) INIT: With -500's:
         let mut fill_event = Event::empty();
@@ -307,14 +306,13 @@ pub fn main() {
         correct_val_count += count.unwrap();
     }
 
-    let final_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration - run_duration;
-
+    let total_duration = chrono::Local::now() - start_time;
 
     printlnc!(yellow_bold: "All {} (float4) result values are correct! \n\
-        Durations => | Create: {} | Enqueue: {} | Run: {} | Final: {} | ",
+        Durations => | Create: {} | Enqueue: {} | Run: {} | Total: {}",
         correct_val_count, fmt_duration(create_duration),
         fmt_duration(enqueue_duration), fmt_duration(run_duration),
-        fmt_duration(final_duration));
+        fmt_duration(total_duration));
 }
 
 

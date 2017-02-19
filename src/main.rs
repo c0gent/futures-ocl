@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
 
 extern crate libc;
+extern crate crossbeam;
 extern crate futures;
 extern crate futures_cpupool;
 extern crate tokio_core;
@@ -14,12 +15,13 @@ extern crate ocl;
 mod extras;
 mod switches;
 
-// use std::io;
+use std::io::Write;
 // use std::thread;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use libc::c_void;
+use crossbeam::sync::MsQueue;
 use futures::{future, stream, Async, Sink, Stream};
 use futures::future::*;
 use futures::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
@@ -108,6 +110,8 @@ pub fn main() {
     let (tx, mut rx) = mpsc::channel(1);
     // let (tx, mut rx) = mpsc::unbounded();
 
+    let mut offloads = MsQueue::new();
+
 
     println!("Enqueuing tasks...");
 
@@ -134,9 +138,9 @@ pub fn main() {
             .arg_buf(&read_buf);
 
 
-        // (-1) INIT: With 0's:
+        // (-1) INIT: With -500's:
         let mut fill_event = Event::empty();
-        write_buf.cmd().fill(ClFloat4(0., 0., 0., 0.), None).enew(&mut fill_event).enq().unwrap();
+        write_buf.cmd().fill(ClFloat4(-500., -500., -500., -500.), None).enew(&mut fill_event).enq().unwrap();
 
         // (0) WRITE: Write a bunch of 50's:
         let mut future_write_data = write_buf.cmd().map().flags(MapFlags::write_invalidate_region())
@@ -153,7 +157,9 @@ pub fn main() {
                     }
                 }
 
-                // println!("Data has been written. ");
+                println!("Data has been written. ");
+
+                data.enqueue_unmap::<(), ()>(None, None, None).unwrap();
 
                 Ok(())
             })
@@ -161,7 +167,12 @@ pub fn main() {
             // .wait().unwrap();
         ;
 
-        write.wait().unwrap();
+        let spawned_write = thread_pool.spawn(write);
+
+        io_queue.finish().unwrap();
+        println!("I/O queue finished.");
+
+        // write.wait().unwrap();
         // thread_pool.spawn(write).wait().unwrap();
 
         // (1) KERNEL: Run kernel (adds 100 to everything):
@@ -172,6 +183,11 @@ pub fn main() {
             .ewait(&unmap_event)
             .enq().unwrap();
 
+        // kern_queue.flush().unwrap();
+        // println!("Kernel queue flushed.");
+
+        kern_queue.finish().unwrap();
+        println!("Kernel queue finished.");
 
         // (2) READ: Read results and verify them:
         let mut future_read_data = read_buf.cmd().map().flags(MapFlags::read())
@@ -199,7 +215,7 @@ pub fn main() {
                     }
 
                     // print!(".");
-                    // println!("Verify done. ");
+                    println!("Verify done. ");
 
                     // Ok(val_count)
                     // Ok(tx.send(val_count).and_then(|_| Ok(()))) // <---- DOESN'T WORK (not sure why)
@@ -209,12 +225,44 @@ pub fn main() {
             .and_then(|_| Ok(()))
         ;
 
-        verify.wait().unwrap();
+        io_queue.finish().unwrap();
+        println!("I/O queue finished.");
+
+        // verify.wait().unwrap();
         // thread_pool.spawn(verify).wait().unwrap();
+        let spawned_verify = thread_pool.spawn(verify);
+
+        let offload = spawned_write.join(spawned_verify);
+
+        offloads.push(offload);
+
+        print!("[.] ");
+        std::io::stdout().flush().unwrap();
     }
+
+    // std::io::stdout().flush().unwrap();
 
     let create_duration = chrono::Local::now() - start_time;
 
+    print!("\n");
+
+    kern_queue.flush().unwrap();
+    io_queue.flush().unwrap();
+
+    let enqueue_duration = chrono::Local::now() - start_time - create_duration;
+
+    while let Some(offload) = offloads.try_pop() {
+        println!("Waiting on offload");
+        // kern_queue.flush().unwrap();
+        // io_queue.flush().unwrap();
+
+        offload.wait().unwrap();
+    }
+
+    // kern_queue.finish().unwrap();
+    // io_queue.finish().unwrap();
+
+    let run_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration;
 
     print!("\n");
 
@@ -226,10 +274,6 @@ pub fn main() {
         // println!("Count: {}", count.unwrap());
         correct_val_count += count.unwrap();
     }
-
-    let enqueue_duration = chrono::Local::now() - start_time - create_duration;
-    let run_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration;
-
 
     let final_duration = chrono::Local::now() - start_time - create_duration - enqueue_duration - run_duration;
 

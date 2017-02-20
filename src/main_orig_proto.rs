@@ -1,18 +1,5 @@
 #![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
 
-extern crate libc;
-extern crate futures;
-extern crate futures_cpupool;
-extern crate tokio_core;
-extern crate tokio_timer;
-extern crate rand;
-extern crate chrono;
-extern crate ocl;
-#[macro_use] extern crate lazy_static;
-#[macro_use] extern crate colorify;
-
-mod extras;
-mod switches;
 
 // use std::io;
 // use std::thread;
@@ -20,6 +7,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use libc::c_void;
+use chrono;
 use futures::{future, stream, Async, Sink, Stream};
 use futures::future::*;
 use futures::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
@@ -28,7 +16,7 @@ use tokio_core::reactor::{Core, Handle};
 use tokio_timer::{Timer, Sleep, TimerError};
 // use self::dinglehopper::Dinglehopper;
 
-use rand::{Rng, XorShiftRng};
+use rand::{self, Rng, XorShiftRng};
 use rand::distributions::{IndependentSample, Range as RandRange};
 use std::collections::{LinkedList, HashMap, BTreeSet};
 use ocl::{core, async, Platform, Device, Context, Queue, Program, Buffer, Kernel, SubBuffer, OclPrm,
@@ -38,7 +26,7 @@ use ocl::flags::{MemFlags, MapFlags, CommandQueueProperties};
 use ocl::aliases::ClFloat4;
 use ocl::async::{FutureResult as FutureAsyncResult, Error as AsyncError};
 
-use extras::{BufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
+use extras_proto::{SubBufferPool, CommandGraph, Command, CommandDetails, KernelArgBuffer, RwCmdIdxs};
 use switches::{Switches, SWITCHES};
 
 // // ORIGINAL SIZES:
@@ -72,7 +60,7 @@ enum TaskKind {
 struct Task {
     task_id: usize,
     cmd_graph: CommandGraph,
-    queue: Queue,
+    // queue: Queue,
     kernels: Vec<Kernel>,
     expected_result: Option<ClFloat4>,
     kind: TaskKind,
@@ -82,11 +70,11 @@ struct Task {
 
 impl Task{
     /// Returns a new, empty task.
-    pub fn new(task_id: usize, queue: Queue, kind: TaskKind, work_size: u32) -> Task {
+    pub fn new(task_id: usize, /*queue: Queue,*/ kind: TaskKind, work_size: u32) -> Task {
         Task {
             task_id: task_id,
             cmd_graph: CommandGraph::new(),
-            queue: queue,
+            // queue: queue,
             kernels: Vec::new(),
             expected_result: None,
             kind: kind,
@@ -144,7 +132,7 @@ impl Task{
     }
 
     /// Fill a buffer with a pattern of data:
-    pub fn fill<T: OclPrm>(&self, pattern: T, cmd_idx: usize, buf_pool: &BufferPool<T>)
+    pub fn fill<T: OclPrm>(&self, pattern: T, cmd_idx: usize, buf_pool: &SubBufferPool<T>)
             -> FutureAsyncResult<()>
     {
         let buffer_id = match *self.cmd_graph.commands()[cmd_idx].details() {
@@ -166,7 +154,7 @@ impl Task{
     }
 
     /// Map some memory for reading or writing.
-    pub fn map<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &BufferPool<T>,
+    pub fn map<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &SubBufferPool<T>,
             /*thread_pool: &CpuPool*/) -> FutureMemMap<T>
     {
         let (buffer_id, flags) = match *self.cmd_graph.commands()[cmd_idx].details(){
@@ -189,7 +177,7 @@ impl Task{
 
     // /// Unmap mapped memory.
     // pub fn unmap<T: OclPrm>(&mut self, data: &mut MemMap<T>, cmd_idx: usize,
-    //         buf_pool: &BufferPool<T>)
+    //         buf_pool: &SubBufferPool<T>)
     // {
     //     let buffer_id = match self.cmd_graph.commands()[cmd_idx].details(){
     //         CommandDetails::Write { target } => target,
@@ -205,7 +193,7 @@ impl Task{
     // }
 
     /// Copy contents of one buffer to another.
-    pub fn copy<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &BufferPool<T>)
+    pub fn copy<T: OclPrm>(&self, cmd_idx: usize, buf_pool: &SubBufferPool<T>)
              -> FutureAsyncResult<()>
     {
         let (src_buf_id, tar_buf_id) = match *self.cmd_graph.commands()[cmd_idx].details(){
@@ -326,7 +314,7 @@ fn gen_kern_src(kernel_name: &str, type_str: &str, simple: bool, add: bool) -> S
 // /// (7) Read:    buffer[6] -> host_mem
 // ///
 // fn create_complex_task(task_id: usize, device: Device, context: &Context,
-//         buf_pool: &mut BufferPool<ClFloat4>, work_size: u32, queue: Queue,
+//         buf_pool: &mut verify<ClFloat4>, work_size: u32, queue: Queue,
 //         rng: &mut XorShiftRng) -> Result<Task, ()>
 // {
 //     // The container for this task:
@@ -443,7 +431,7 @@ fn gen_kern_src(kernel_name: &str, type_str: &str, simple: bool, add: bool) -> S
 // }
 
 
-// fn enqueue_complex_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
+// fn enqueue_complex_task(task: &mut Task, buf_pool: &SubBufferPool<ClFloat4>, thread_pool: &CpuPool) {
 //     // (0) Initially write 500s:
 //     let write_cmd_idx = 0;
 //     let future_data = task.map(write_cmd_idx, buf_pool, thread_pool);
@@ -479,7 +467,7 @@ fn gen_kern_src(kernel_name: &str, type_str: &str, simple: bool, add: bool) -> S
 // }
 
 
-// fn verify_complex_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
+// fn verify_complex_task(task: &mut Task, buf_pool: &SubBufferPool<ClFloat4>, thread_pool: &CpuPool,
 //         correct_val_count: &mut usize)
 // {
 //     // (7) Final read from device:
@@ -515,7 +503,8 @@ fn gen_kern_src(kernel_name: &str, type_str: &str, simple: bool, add: bool) -> S
 /// (2) Read data
 ///
 fn create_simple_task(task_id: usize, device: Device, context: &Context,
-        buf_pool: &mut BufferPool<ClFloat4>, work_size: u32, queue: Queue) -> Result<Task, ()>
+        buf_pool: &mut SubBufferPool<ClFloat4>, work_size: u32, write_queue: Queue,
+        read_queue: Queue, kern_queue: Queue) -> Result<Task, ()>
 {
     let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only());
     let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only());
@@ -523,7 +512,7 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
     // let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only() | MemFlags::alloc_host_ptr());
 
     // The container for this task:
-    let mut task = Task::new(task_id, queue.clone(), TaskKind::Simple, work_size);
+    let mut task = Task::new(task_id, TaskKind::Simple, work_size);
 
     // Allocate our input buffer:
     let write_buf_id = match buf_pool.alloc(work_size, write_buf_flags) {
@@ -540,19 +529,19 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
         },
     };
 
-    let write_buf = buf_pool.get(write_buf_id).unwrap();
-    let read_buf = buf_pool.get(read_buf_id).unwrap();
+    buf_pool.get_mut(write_buf_id).unwrap().set_default_queue(write_queue);
+    buf_pool.get_mut(read_buf_id).unwrap().set_default_queue(read_queue);
 
     let program = Program::builder()
         .devices(device)
         .src(gen_kern_src("kern", "float4", true, true))
         .build(context).unwrap();
 
-    let kern = Kernel::new("kern", &program, queue).unwrap()
+    let kern = Kernel::new("kern", &program, kern_queue).unwrap()
         .gws(work_size)
-        .arg_buf(write_buf)
+        .arg_buf(buf_pool.get(write_buf_id).unwrap())
         .arg_vec(ClFloat4(100., 100., 100., 100.))
-        .arg_buf(read_buf);
+        .arg_buf(buf_pool.get(read_buf_id).unwrap());
 
     // (0) Initial write to device:
     assert!(task.add_write_command(write_buf_id).unwrap() == 0);
@@ -572,7 +561,7 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
 
 
 
-// fn enqueue_simple_task(task: &Task, buf_pool: &BufferPool<ClFloat4>, /*handle: &Handle,*/
+// fn enqueue_simple_task(task: &Task, buf_pool: &SubBufferPool<ClFloat4>, /*handle: &Handle,*/
 //         mut tx: Sender<usize>) /*-> BoxFuture<usize, AsyncError>*/
 // {
 //     // (0) Write a bunch of 50's:
@@ -721,7 +710,7 @@ fn create_simple_task(task_id: usize, device: Device, context: &Context,
 
 /// Creates a large number of both simple and complex asynchronous tasks and
 /// verifies that they all execute correctly.
-fn main() {
+pub fn main() {
     use std::mem;
     use ocl::core::{Event as EventCore};
 
@@ -755,10 +744,11 @@ fn main() {
 
     // Queues (events coordinated by command graph):
     let queue_flags = Some(SWITCHES.queue_flags);
-    let io_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let write_queue = Queue::new(&context, device, queue_flags).unwrap();
+    let read_queue = Queue::new(&context, device, queue_flags).unwrap();
     let kern_queue = Queue::new(&context, device, queue_flags).unwrap();
 
-    let mut buf_pool: BufferPool<ClFloat4> = BufferPool::new(INITIAL_BUFFER_LEN, io_queue.clone());
+    let mut buf_pool: SubBufferPool<ClFloat4> = SubBufferPool::new(INITIAL_BUFFER_LEN, write_queue.clone());
     // let mut simple_tasks: Vec<Task> = Vec::new();
     // let mut complex_tasks: Vec<Task> = Vec::new();
     let mut tasks: HashMap<usize, Task> = HashMap::new();
@@ -777,7 +767,7 @@ fn main() {
             // Create task if there is room in the buffer pool:
             let task_id = tasks.len();
             let task = match create_simple_task(task_id, device, &context, &mut buf_pool,
-                    work_size, kern_queue.clone())
+                    work_size, write_queue.clone(), read_queue.clone(), kern_queue.clone())
             {
                 Ok(task) => task,
                 Err(_) => {
@@ -837,13 +827,13 @@ fn main() {
 
     // let future_tasks = ;
 
-    let mut write_futures = Vec::with_capacity(tasks.len());
+    let mut futures = Vec::with_capacity(tasks.len());
 
     // let enqueue_all = stream::iter(tasks.values().map(|t| Ok::<_, ()>(t))).for_each(|task| {
     for task in tasks.values() {
         let tx = tx.clone();
 
-        println!("(0)");
+        // println!("(0)");
 
         let write_map = task.map(0, &buf_pool);
 
@@ -854,32 +844,25 @@ fn main() {
                     *val = ClFloat4(50., 50., 50., 50.);
                 }
 
-                println!("Data has been written. ");
+                // println!("Data has been written. ");
 
                 Ok(())
             })
-            .then(|_| Ok::<_, ()>(()))
+            // .then(|_| Ok::<_, ()>(()))
         // .wait().unwrap();
         ;
 
         // write_write.wait().unwrap();
         // let write_spawn = thread_pool.spawn(write_write);
         // write_futures.push(write_write);
-        write_futures.push(thread_pool.spawn(write_write));
+        let write_spawned = thread_pool.spawn(write_write);
 
-        println!("(1)");
+        // println!("(1)");
 
         // (1) Run kernel (adds 100 to everything):
-        let kernel =
-            // .and_then(|_| {
-                task.kernel(1)
-            // })
-        ;
+        let kernel_future = task.kernel(1);
 
-        thread_pool.spawn(kernel).forget();
-
-
-        println!("(2)");
+        // println!("(2)");
 
         // (2) Read results and verify them:
         let verify =
@@ -895,42 +878,37 @@ fn main() {
                         val_count += 1;
                     }
 
-                    println!("Verify done. ");
+                    // println!("Verify done. ");
 
                     // Ok(val_count)
                     // Ok(tx.send(val_count).and_then(|_| Ok(()))) // <---- DOESN'T WORK (not sure why)
                     Ok(tx.send(val_count).wait())
                 })
             // })
-            .and_then(|_| Ok(()))
+            // .and_then(|_| Ok(()))
         ;
 
-        thread_pool.spawn(verify).forget();
+        let verify_spawned = thread_pool.spawn(verify);
 
-            // .wait().unwrap();
-
-        // println!(" Returning... ");
-
-        // write.and_then(|_| kernel)
-        //     .and_then(|_| verify)
-        //     // .boxed()
-        //     .wait().unwrap();
-
-        // thread_pool.spawn(write).wait().unwrap();
-        // kernel.wait().unwrap();
-        // verify.wait().unwrap();
-
+        futures.push(write_spawned.join(verify_spawned));
     }
     // );
 
-    thread_pool.spawn_fn(|| {
-        for future in write_futures {
-            // spawn.forget();
-            future.wait().unwrap();
-        }
 
-        Ok::<(), ()>(())
+    stream::futures_unordered(futures).for_each(|_| {
+        // correct_val_count.set(correct_val_count.get() + val_count);
+        // println!("Task: {} has completed.", task_id);
+        Ok(())
     }).wait().unwrap();
+
+    // thread_pool.spawn_fn(|| {
+    //     for future in futures {
+    //         // spawn.forget();
+    //         future.wait().unwrap();
+    //     }
+
+    //     Ok::<(), ()>(())
+    // }).wait().unwrap();
 
 
 
@@ -979,7 +957,7 @@ fn main() {
     rx.close();
 
     for count in rx.wait() {
-        println!("Count: {}", count.unwrap());
+        // println!("Count: {}", count.unwrap());
         correct_val_count += count.unwrap();
     }
 
@@ -1025,7 +1003,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 // /// (2) Read data
 // ///
 // fn create_simple_task(task_id: usize, device: Device, context: &Context,
-//         buf_pool: &mut BufferPool<ClFloat4>, work_size: u32, queue: Queue) -> Result<Task, ()>
+//         buf_pool: &mut SubBufferPool<ClFloat4>, work_size: u32, queue: Queue) -> Result<Task, ()>
 // {
 //     let write_buf_flags = Some(MemFlags::read_only() | MemFlags::host_write_only());
 //     let read_buf_flags = Some(MemFlags::write_only() | MemFlags::host_read_only());
@@ -1088,7 +1066,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 // //#############################################################################
 
 
-// fn initiate_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool) {
+// fn initiate_simple_task(task: &mut Task, buf_pool: &SubBufferPool<ClFloat4>, thread_pool: &CpuPool) {
 //     // (0) Write a bunch of 50's:
 //     let cmd_idx = 0;
 //     let task_id = task.task_id;
@@ -1144,7 +1122,7 @@ fn fmt_duration(duration: chrono::Duration) -> String {
 // //#############################################################################
 // //#############################################################################
 
-// fn verify_simple_task(task: &mut Task, buf_pool: &BufferPool<ClFloat4>, thread_pool: &CpuPool,
+// fn verify_simple_task(task: &mut Task, buf_pool: &SubBufferPool<ClFloat4>, thread_pool: &CpuPool,
 //         correct_val_count: &mut usize)
 // {
 //     // (2) Read results and verify them:
